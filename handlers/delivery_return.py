@@ -206,31 +206,26 @@ async def process_delivery_date(message: Message, state: FSMContext):
 async def confirm_add_action(callback, state: FSMContext):
     data = await state.get_data()
     receipt = data["receipt"]
-    parsed_data = data["parsed_data"]  # ← нужен для excluded_sum
+    parsed_data = data["parsed_data"]
     username = callback.from_user.username or str(callback.from_user.id)
-    delivery_dates = receipt.get("delivery_dates", [])  # ← получаем список дат
+    delivery_dates = receipt.get("delivery_dates", [""] * len(receipt["items"]))
 
-    # Определяем, была ли выбрана "Доставка"
-    is_delivery = receipt.get("receipt_type") == "Предоплата"  # "Предоплата" → "Доставка"
+    is_delivery = receipt.get("receipt_type") == "Предоплата"
     receipt_type_for_save = "Доставка" if is_delivery else "Покупка"
 
     for i, item in enumerate(receipt["items"]):
-        item_receipt = receipt.copy()
-        item_receipt["items"] = [item]
-        customer = item_receipt.get("customer", "Неизвестно")
-
-        # Передаём delivery_date и правильный тип
+        logger.info(f"Товар {i}: {item['name']}, дата: {delivery_dates[i]}")
+        customer = receipt.get("customer", "Неизвестно")
         await save_receipt(
             parsed_data=parsed_data,
             username=username,
             user_id=callback.from_user.id,
             customer=customer,
             receipt_type=receipt_type_for_save,
-            delivery_date=delivery_dates[i] if i < len(delivery_dates) else ""  # ← передаём дату
+            delivery_date=delivery_dates[i] if i < len(delivery_dates) else ""
         )
 
     await callback.message.answer(f"Чек с фискальным номером {receipt['fiscal_doc']} успешно добавлен.")
-    logger.info(f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, user_id={callback.from_user.id}")
     await state.clear()
     await callback.answer()
 

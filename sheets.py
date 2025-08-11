@@ -4,6 +4,7 @@ import logging
 from config import SHEET_NAME, GOOGLE_CREDENTIALS
 from datetime import datetime  # Импорт datetime
 from googleapiclient.errors import HttpError
+import traceback
 
 logger = logging.getLogger("AccountingBot")
 
@@ -33,7 +34,10 @@ async def is_fiscal_doc_unique(fiscal_doc):
 
 # sheets.py — обновлённая функция save_receipt
 
+# sheets.py
+
 async def save_receipt(parsed_data, username, user_id, customer, receipt_type="Доставка", delivery_date=None, operation_type=None):
+    logger.info(f"[SAVE_RECEIPT] Вызов для товара: {item['name']}, delivery_date={delivery_date}, stack=" + str(traceback.extract_stack()[-3:-1]))
     try:
         fiscal_doc = parsed_data["fiscal_doc"]
         if not await is_fiscal_doc_unique(fiscal_doc):
@@ -61,8 +65,8 @@ async def save_receipt(parsed_data, username, user_id, customer, receipt_type="�
                 str(item["sum"]),
                 username,
                 shop,
-                delivery_date or "",  # ← теперь используется переданная дата
-                "Ожидает" if receipt_type == "Доставка" else "Доставлено",  # ← статус зависит от типа
+                delivery_date or "",  # ← используем переданную дату
+                "Ожидает" if receipt_type == "Доставка" else "Доставлено",
                 customer,
                 item["name"],
                 receipt_type,
@@ -77,6 +81,7 @@ async def save_receipt(parsed_data, username, user_id, customer, receipt_type="�
                 body={"values": [row]}
             ).execute()
             logger.info(f"Чек сохранен: fiscal_doc={fiscal_doc}, item={item['name']}, delivery_date={delivery_date}, user_id={user_id}")
+
 
         # Запись в сводку
         summary_note = f"{fiscal_doc} - {', '.join(item['name'] for item in items)}"
