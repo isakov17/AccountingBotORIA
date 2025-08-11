@@ -1,0 +1,53 @@
+.env
+credentials.json
+logs/*
+/tmp/accounting_bot.lock
+pycache/
+*.pyc
+code.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.orig
+*.rej
+.*.swp
+*.py[co]
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Логи
+code.txt
+*.log
+
+# Конфиденциальные файлы
+config.py
+.env
+credentials.json
