@@ -206,33 +206,49 @@ async def process_delivery_date(message: Message, state: FSMContext):
 async def confirm_add_action(callback, state: FSMContext):
     data = await state.get_data()
     receipt = data["receipt"]
-    parsed_data = data["parsed_data"]  # ← нужен для excluded_sum
+    parsed_data = data["parsed_data"]  # нужен для даты/магазина/qr/fiscalDoc
     username = callback.from_user.username or str(callback.from_user.id)
-    delivery_dates = receipt.get("delivery_dates", [])  # ← получаем список дат
+    delivery_dates = receipt.get("delivery_dates", [])
 
-    # Определяем, была ли выбрана "Доставка"
-    is_delivery = receipt.get("receipt_type") == "Предоплата"  # "Предоплата" → "Доставка"
+    # "Предоплата" на кнопке → в таблицу как "Доставка"
+    is_delivery = receipt.get("receipt_type") == "Предоплата"
     receipt_type_for_save = "Доставка" if is_delivery else "Покупка"
 
+    ok, fail = 0, 0
     for i, item in enumerate(receipt["items"]):
-        item_receipt = receipt.copy()
-        item_receipt["items"] = [item]
-        customer = item_receipt.get("customer", "Неизвестно")
+        # под каждую позицию — индивидуальная дата доставки
+        one = {
+            "date": parsed_data["date"],
+            "store": parsed_data.get("store", "Неизвестно"),
+            "items": [ {"name": item["name"], "sum": item["sum"]} ],
+            "receipt_type": "Полный" if not is_delivery else "Доставка",
+            "fiscal_doc": parsed_data["fiscal_doc"],
+            "qr_string": parsed_data["qr_string"],
+            "delivery_date": delivery_dates[i] if i < len(delivery_dates) else "",
+            "status": "Ожидает" if is_delivery else "Доставлено",
+            "customer": receipt.get("customer", data.get("customer", "Неизвестно")),
+        }
 
-        # Передаём delivery_date и правильный тип
-        await save_receipt(
-            parsed_data=parsed_data,
-            username=username,
-            user_id=callback.from_user.id,
-            customer=customer,
-            receipt_type=receipt_type_for_save,
-            delivery_date=delivery_dates[i] if i < len(delivery_dates) else ""  # ← передаём дату
-        )
+        saved = await save_receipt(one, username, callback.from_user.id, receipt_type=receipt_type_for_save)
+        if saved:
+            ok += 1
+        else:
+            fail += 1
 
-    await callback.message.answer(f"Чек с фискальным номером {receipt['fiscal_doc']} успешно добавлен.")
-    logger.info(f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, user_id={callback.from_user.id}")
+    if ok and not fail:
+        await callback.message.answer(f"Чек {receipt['fiscal_doc']} добавлен. Позиции: {ok}/{ok}.")
+    elif ok and fail:
+        await callback.message.answer(f"Чек {receipt['fiscal_doc']} добавлен частично. Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей.")
+    else:
+        await callback.message.answer(f"Не удалось сохранить чек {receipt['fiscal_doc']}. Попробуй ещё раз или /add_manual.")
+
+    logger.info(
+        "Чек подтвержден: fiscal_doc=%s, saved=%d, failed=%d, user_id=%s",
+        receipt['fiscal_doc'], ok, fail, callback.from_user.id
+    )
     await state.clear()
     await callback.answer()
+
 
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "cancel_add")
 async def cancel_add_action(callback, state: FSMContext):
@@ -475,23 +491,58 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Пожалуйста, отправьте фото QR-кода.", reply_markup=keyboard)
         logger.info(f"Фото отсутствует для возврата: user_id={message.from_user.id}")
         return
+
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed_data:
         keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
         await message.answer("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=keyboard)
         logger.info(f"Ошибка обработки QR-кода для возврата: user_id={message.from_user.id}")
         return
+
     if parsed_data["operation_type"] != 2:
         keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
         await message.answer("Чек должен быть возвратом (operationType == 2).", reply_markup=keyboard)
         logger.info(f"Некорректный чек для возврата: operation_type={parsed_data['operation_type']}, user_id={message.from_user.id}")
         return
+
+    # === Новый блок: проверяем, что в чеке возврата реально есть нужный товар ===
+    data = await state.get_data()
+    expected_item = (data or {}).get("item_name", "")
+
+    def norm(s: str) -> str:
+        s = (s or "").lower()
+        s = " ".join(s.split())
+        return s
+
+    tgt = norm(expected_item)
+    found_match = False
+    for it in parsed_data.get("items", []):
+        name = norm(it.get("name", ""))
+        # строгая проверка + «мягкая» (на случай различий артикулов/хвостов)
+        if name == tgt or (tgt and (tgt in name or name in tgt)):
+            found_match = True
+            break
+
+    if not found_match:
+        keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
+        await message.answer(f"Товар «{expected_item}» не найден в чеке возврата.", reply_markup=keyboard)
+        logger.info(
+            "Товар не найден в чеке возврата: need=%s, got_items=%s, user_id=%s",
+            expected_item,
+            [x.get('name') for x in parsed_data.get('items', [])],
+            message.from_user.id
+        )
+        return
+    # === конец нового блока ===
+
     new_fiscal_doc = parsed_data["fiscal_doc"]
     if not await is_fiscal_doc_unique(new_fiscal_doc):
         keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
         await message.answer(f"Чек с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=keyboard)
         logger.info(f"Дубликат фискального номера: new_fiscal_doc={new_fiscal_doc}, user_id={message.from_user.id}")
         return
+
+    # Остальной код — как у тебя было:
     data = await state.get_data()
     fiscal_doc = data["fiscal_doc"]
     item_name = data["item_name"]
@@ -548,6 +599,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.", reply_markup=keyboard)
         logger.error(f"Неожиданная ошибка обработки возврата: {str(e)}, user_id={message.from_user.id}")
 
+
+
 @router.callback_query(ReturnReceipt.CONFIRM_ACTION)
 async def confirm_return_action(callback, state: FSMContext):
     data = await state.get_data()
@@ -563,20 +616,25 @@ async def get_balance(message: Message):
         await message.answer("Доступ запрещен.")
         logger.info(f"Доступ запрещен для /balance: user_id={message.from_user.id}")
         return
+
+    balance_data = await get_monthly_balance()
+
     try:
-        balance_data = await get_monthly_balance()
-        if balance_data:
-            await message.answer(
-                f"Текущий баланс:\n"
-                f"Потрачено: {abs(balance_data['spent']):.2f} RUB\n"
-                f"Возвращено: {balance_data['returned']:.2f} RUB\n"
-                f"Обновление баланса: {balance_data['balance_update']:.2f} RUB\n"
-                f"Остаток: {balance_data['balance']:.2f} RUB"
-            )
-            logger.info(f"Баланс выдан: spent={abs(balance_data['spent'])}, returned={balance_data['returned']}, balance={balance_data['balance']}, user_id={message.from_user.id}")
-        else:
-            await message.answer("Ошибка получения данных о балансе.")
-            logger.error(f"Ошибка получения баланса: user_id={message.from_user.id}")
+        spent = abs(balance_data.get("spent", 0.0))
+        returned = balance_data.get("returned", 0.0)
+        balance = balance_data.get("balance", 0.0)
+
+        await message.answer(
+            f"Текущий баланс:\n"
+            f"Потрачено: {spent:.2f} RUB\n"
+            f"Возвращено: {returned:.2f} RUB\n"
+            f"Остаток: {balance:.2f} RUB"
+        )
+
+        logger.info(
+            f"Баланс выдан: spent={spent}, returned={returned}, balance={balance}, user_id={message.from_user.id}"
+        )
+
     except Exception as e:
         await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.")
         logger.error(f"Неожиданная ошибка /balance: {str(e)}, user_id={message.from_user.id}")

@@ -14,9 +14,19 @@ creds = service_account.Credentials.from_service_account_info(
 sheets_service = build('sheets', 'v4', credentials=creds)
 
 async def is_user_allowed(user_id):
-    allowed_users = [860613320, 803109062, 400996041, 1059161513]
-    logger.info(f"Проверка пользователя {user_id}. Разрешенные пользователи: {allowed_users}")
-    return user_id in allowed_users
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+        ).execute()
+        allowed_users = [int(row[0]) for row in result.get("values", [])[1:] if row and row[0].isdigit()]
+        logger.info(f"Проверка пользователя {user_id}. Разрешенные пользователи: {allowed_users}")
+        return user_id in allowed_users
+    except HttpError as e:
+        logger.error(f"Ошибка получения списка пользователей: {e.status_code} - {e.reason}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка получения списка пользователей: {str(e)}")
+        return False
 
 async def is_fiscal_doc_unique(fiscal_doc):
     try:
@@ -33,141 +43,268 @@ async def is_fiscal_doc_unique(fiscal_doc):
 
 # sheets.py — обновлённая функция save_receipt
 
-async def save_receipt(parsed_data, username, user_id, customer, receipt_type="Доставка", delivery_date=None, operation_type=None):
+# sheets.py
+from datetime import datetime
+import logging
+
+logger = logging.getLogger("AccountingBot")
+
+async def save_receipt(
+    data_or_parsed=None,
+    username: str = "",
+    user_id: int | str = None,
+    customer: str | None = None,
+    receipt_type: str = "Покупка",
+    delivery_date: str | None = None,
+    operation_type: int | None = None,
+    **kwargs
+):
+    """
+    Универсальная запись одной позиции чека в лист 'Чеки' + строка в 'Сводка'.
+    Поддерживает два способа вызова:
+      1) save_receipt(parsed_data=..., username=..., user_id=..., customer=..., receipt_type=..., delivery_date=...)
+      2) save_receipt(receipt, username, user_id, receipt_type="Покупка")   # где receipt['items'] = [одна позиция]
+
+    Возвращает: True/False
+    """
+
+    # Совместимость со старыми вызовами
+    if data_or_parsed is None:
+        if "parsed_data" in kwargs:
+            data_or_parsed = kwargs["parsed_data"]
+        elif "receipt" in kwargs:
+            data_or_parsed = kwargs["receipt"]
+
     try:
-        fiscal_doc = parsed_data["fiscal_doc"]
-        if not await is_fiscal_doc_unique(fiscal_doc):
-            logger.info(f"Чек уже существует: fiscal_doc={fiscal_doc}, user_id={user_id}")
-            return False
+        # Определяем, что нам передали: уже «собранный» receipt или «сырой» parsed_data
+        is_receipt_like = isinstance(data_or_parsed, dict) and (
+            "status" in data_or_parsed or "receipt_type" in data_or_parsed or "customer" in data_or_parsed
+        )
+        data = data_or_parsed or {}
 
-        date_str = parsed_data["date"]
-        date = datetime.strptime(date_str, "%Y.%m.%d").strftime("%d.%m.%Y")
-        shop = parsed_data.get("store", "Unknown")
-        qr_string = parsed_data["qr_string"]
-
-        if operation_type is None:
-            operation_type = "Доставка" if receipt_type == "Доставка" else "Покупка"
-
-        items = parsed_data["items"]
-        excluded_sum = parsed_data.get("excluded_sum", 0.0)
-        excluded_items = parsed_data.get("excluded_items", [])
-
-        total_sum = sum(item["sum"] for item in items) + excluded_sum
-
-        for item in items:
-            row = [
-                datetime.now().strftime("%d.%m.%Y %H:%M"),
-                date,
-                str(item["sum"]),
-                username,
-                shop,
-                delivery_date or "",  # ← теперь используется переданная дата
-                "Ожидает" if receipt_type == "Доставка" else "Доставлено",  # ← статус зависит от типа
-                customer,
-                item["name"],
-                receipt_type,
-                fiscal_doc,
-                qr_string,
-                ""
-            ]
-            sheets_service.spreadsheets().values().append(
-                spreadsheetId=SHEET_NAME,
-                range="Чеки!A:M",
-                valueInputOption="RAW",
-                body={"values": [row]}
-            ).execute()
-            logger.info(f"Чек сохранен: fiscal_doc={fiscal_doc}, item={item['name']}, delivery_date={delivery_date}, user_id={user_id}")
-
-        # Запись в сводку
-        summary_note = f"{fiscal_doc} - {', '.join(item['name'] for item in items)}"
-        if excluded_items:
-            summary_note += f" (+ {', '.join(excluded_items)})"
-
-        if receipt_type == "Полный":
-            await save_receipt_summary(date, "Покупка", total_sum, f"{summary_note} (Полный расчет)")
+        # Нормализация полей
+        if is_receipt_like:
+            # Ожидаем одну позицию в data["items"]
+            if not data.get("items"):
+                logger.error(f"save_receipt: пустой список items, user_id={user_id}")
+                return False
+            item = data["items"][0]
+            item_name = item["name"]
+            item_sum = float(item.get("sum", 0))
+            store = data.get("store", "Неизвестно")
+            raw_date = data.get("date") or datetime.now().strftime("%Y.%m.%d")
+            qr_string = data.get("qr_string", "")
+            fiscal_doc = data.get("fiscal_doc", "")
+            status = data.get("status", "Доставлено" if receipt_type in ("Покупка", "Полный") else "Ожидает")
+            customer = data.get("customer", customer or "Неизвестно")
+            # при многотоварной доставке сюда уже попадает индивидуальная дата
+            delivery_date_final = data.get("delivery_date", delivery_date or "")
+            # «Тип чека» в табличной терминологии
+            type_for_sheet = data.get("receipt_type", receipt_type)
         else:
-            await save_receipt_summary(date, "Покупка", -total_sum, summary_note)
+            # parsed_data с proverkacheka
+            fiscal_doc = data.get("fiscal_doc", "")
+            if not await is_fiscal_doc_unique(fiscal_doc):
+                logger.info(f"Чек уже существует: fiscal_doc={fiscal_doc}, user_id={user_id}")
+                return False
 
+            raw_date = data.get("date") or datetime.now().strftime("%Y.%m.%d")
+            store = data.get("store", "Неизвестно")
+            qr_string = data.get("qr_string", "")
+            # ожидаем, что вызывающая сторона передаёт одну позицию → прокинем delivery_date параметром
+            # и внешним циклом вызывают функцию по каждой позиции
+            # но на всякий случай возьмём первую
+            items = data.get("items", [])
+            if not items:
+                logger.error(f"save_receipt: пустой список items (parsed_data), user_id={user_id}")
+                return False
+            item = items[0]
+            item_name = item["name"]
+            item_sum = float(item.get("sum", 0))
+            status = "Ожидает" if receipt_type in ("Доставка", "Предоплата") else "Доставлено"
+            type_for_sheet = "Доставка" if receipt_type in ("Доставка", "Предоплата") else ("Полный" if receipt_type == "Полный" else "Покупка")
+            delivery_date_final = delivery_date or ""
+            customer = customer or "Неизвестно"
+
+        # Приведение даты чека к dd.mm.yyyy
+        def _normalize_date(s: str) -> str:
+            s = s.replace("-", ".")
+            # Встречаются форматы: YYYY.MM.DD, DD.MM.YYYY
+            try:
+                if s.count(".") == 2:
+                    parts = s.split(".")
+                    if len(parts[0]) == 4:  # YYYY.MM.DD
+                        return datetime.strptime(s, "%Y.%m.%d").strftime("%d.%m.%Y")
+                    else:                   # DD.MM.YYYY
+                        return datetime.strptime(s, "%d.%m.%Y").strftime("%d.%m.%Y")
+            except Exception:
+                pass
+            # fallback: сегодня
+            return datetime.now().strftime("%d.%m.%Y")
+
+        date_for_sheet = _normalize_date(raw_date)
+        added_at = datetime.now().strftime("%d.%m.%Y")
+
+        # Формирование строки для листа "Чеки"
+        # Колонки: A..M
+        row = [
+            added_at,                 # A: Дата добавления
+            date_for_sheet,           # B: Дата чека
+            f"{item_sum:.2f}",        # C: Сумма
+            str(username or user_id), # D: Пользователь (логин или id)
+            store,                    # E: Магазин
+            delivery_date_final or "",# F: Дата доставки
+            status,                   # G: Статус
+            customer,                 # H: Заказчик
+            item_name,                # I: Товар
+            type_for_sheet,           # J: Тип чека (Доставка/Покупка/Полный)
+            str(fiscal_doc),          # K: Фискальный номер
+            qr_string,                # L: QR-строка
+            ""                        # M: QR-строка возврата (позже)
+        ]
+
+        # Пишем в "Чеки"
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SHEET_NAME,
+            range="Чеки!A:M",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+
+        # Сводка: «Покупка» → отрицательная сумма
+        from math import copysign
+        sum_for_summary = -abs(item_sum)   # покупка/предоплата всегда минус
+        await save_receipt_summary(
+            date=date_for_sheet,
+            operation_type="Покупка",
+            sum_value=sum_for_summary,
+            note=f"{fiscal_doc} - {item_name}"
+        )
+
+        logger.info(
+            "Чек сохранен: fiscal_doc=%s, item=%s, delivery_date=%s, user_id=%s",
+            fiscal_doc, item_name, delivery_date_final or "", user_id
+        )
         return True
 
-    except HttpError as e:
-        logger.error(f"Ошибка сохранения чека: {e.status_code} - {e.reason}, user_id={user_id}")
-        return False
     except Exception as e:
-        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_id={username}")
+        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_id={user_id}")
         return False
 
+
 async def save_receipt_summary(date, operation_type, sum_value, note):
+    print(f"Сохранение: {sum_value}, note: {note}")
     try:
-        # Получаем текущий баланс
+        # Получаем текущие данные
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SHEET_NAME, range="Сводка!A:E"
         ).execute()
-        rows = result.get("values", [])[1:]  # Пропускаем заголовок
-        current_balance = 0
-        if rows:
-            current_balance = float(rows[-1][3]) if len(rows[-1]) > 3 and rows[-1][3] else 0
+        rows = result.get("values", [])
+        
+        # Определяем текущий баланс
+        current_balance = 0.0
+        if len(rows) > 1:
+            last_row = rows[-1]
+            # Баланс — в 4-м столбце (D)
+            if len(last_row) > 3 and last_row[3]:
+                try:
+                    current_balance = float(last_row[3])
+                except ValueError:
+                    pass
+
+        # Определяем, куда писать сумму
+        income = ""
+        expense = ""
+        if sum_value > 0:
+            income = f"{sum_value:.2f}"
+            expense = ""
+        else:
+            income = ""
+            expense = f"{abs(sum_value):.2f}"  # только положительное число в расход
+
         new_balance = current_balance + sum_value
+
         summary_row = [
             date,
             operation_type,
-            f"{sum_value:.2f}",
-            f"{new_balance:.2f}",
+            income,
+            expense,
             note
         ]
+
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SHEET_NAME,
             range="Сводка!A:E",
             valueInputOption="RAW",
             body={"values": [summary_row]}
         ).execute()
-        logger.info(f"Запись в Сводка: date={date}, operation_type={operation_type}, sum={sum_value}, balance={new_balance}")
+
+        logger.info(f"Запись в Сводка: {summary_row}, баланс: {new_balance:.2f}")
+
     except HttpError as e:
         logger.error(f"Ошибка записи в Сводка: {e.status_code} - {e.reason}")
         raise
     except Exception as e:
         logger.error(f"Неожиданная ошибка записи в Сводка: {str(e)}")
         raise
-
+    
+    
 async def get_monthly_balance():
+    """
+    Получает общие траты, возвраты и баланс из листа 'Сводка'.
+    """
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SHEET_NAME, range="Сводка!A:E"
         ).execute()
+
         rows = result.get("values", [])[1:]  # Пропускаем заголовок
-        total_balance = 0
-        monthly_spent = 0
-        monthly_returned = 0
-        current_month = datetime.now().strftime("%m.%Y")
+
+        spent = 0.0
+        returned = 0.0
+        balance = 0.0
+
         for row in rows:
-            if len(row) < 3 or not row[2]:  # Пропускаем строки без суммы
-                continue
-            try:
-                amount = float(row[2])
-                date = row[0] if len(row) > 0 else ""
-                operation_type = row[1] if len(row) > 1 else ""
-                # Общий баланс
-                if operation_type in ["Покупка", "Начальный баланс"]:
-                    total_balance += amount  # Отрицательные для покупок, положительные для начального баланса
-                elif operation_type == "Возврат":
-                    total_balance += amount  # Положительные для возвратов
-                # Траты и возвраты за текущий месяц
-                if date and date.endswith(current_month):
+            if len(row) < 4:
+                continue  # Слишком мало столбцов
+
+            # Приход (столбец C)
+            income_str = row[2] if len(row) > 2 else ""
+            # Расход (столбец D)
+            expense_str = row[3] if len(row) > 3 else ""
+
+            operation_type = row[1] if len(row) > 1 else ""
+
+            # Обрабатываем приход
+            if income_str:
+                try:
+                    income = float(income_str)
+                    balance += income
+                    if operation_type == "Возврат":
+                        returned += income
+                except ValueError:
+                    logger.error(f"Некорректный приход: {income_str}, строка: {row}")
+
+            # Обрабатываем расход
+            if expense_str:
+                try:
+                    expense = float(expense_str)
+                    balance -= expense
                     if operation_type == "Покупка":
-                        monthly_spent += abs(amount)  # Абсолютная сумма для трат
-                    elif operation_type == "Возврат":
-                        monthly_returned += amount
-            except ValueError:
-                logger.error(f"Некорректная сумма в строке: {row}")
-                continue
+                        spent += expense
+                except ValueError:
+                    logger.error(f"Некорректный расход: {expense_str}, строка: {row}")
+
         return {
-            "total_balance": total_balance,
-            "monthly_spent": monthly_spent,
-            "monthly_returned": monthly_returned
+            "spent": round(spent, 2),
+            "returned": round(returned, 2),
+            "balance": round(balance, 2)
         }
+
     except HttpError as e:
-        logger.error(f"Ошибка получения баланса из Google Sheets: {e.status_code} - {e.reason}")
-        return None
+        logger.error(f"Ошибка получения баланса: {e.status_code} - {e.reason}")
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0}
     except Exception as e:
-        logger.error(f"Неожиданная ошибка получения баланса: {str(e)}")
-        return None
+        logger.error(f"Ошибка получения баланса: {str(e)}")
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0}
