@@ -21,7 +21,7 @@ async def parse_qr_from_photo(bot, file_id):
                     data_json = result.get("data", {}).get("json", {})
                     if data_json:
                         items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()
+                        excluded_items = get_excluded_items()  # Загружаем исключения один раз
                         filtered_items = []
                         excluded_sum = 0.0
 
