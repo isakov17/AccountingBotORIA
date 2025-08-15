@@ -171,3 +171,12 @@ INFO:AccountingBot:Чек подтвержден: fiscal_doc=168756, saved=2, fa
 INFO:aiogram.event:Update id=58287505 is handled. Duration 2215 ms by bot id=7756177382
 
 INFO:AccountingBot:Найден исключённый товар: 'Обработка заказа в пункте выдачи' (цена: 75.1) этот товар не попадает в сводку. хотя должен.
+
+
+
+
+
+
+
+
+

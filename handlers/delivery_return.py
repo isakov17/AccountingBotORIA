@@ -725,28 +725,43 @@ async def confirm_return_action(callback, state: FSMContext):
 @router.message(Command("balance"))
 async def get_balance(message: Message):
     if not await is_user_allowed(message.from_user.id):
-        await message.answer("Доступ запрещен.")
+        await message.answer("🚫 Доступ запрещен.")
         logger.info(f"Доступ запрещен для /balance: user_id={message.from_user.id}")
         return
 
-    balance_data = await get_monthly_balance()
-
+    loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
     try:
-        spent = abs(balance_data.get("spent", 0.0))
-        returned = balance_data.get("returned", 0.0)
-        balance = balance_data.get("balance", 0.0)
+        balance_data = await get_monthly_balance()
+        if balance_data:
+            initial_balance = balance_data.get("initial_balance", 0.0)
+            spent = abs(balance_data.get("spent", 0.0))
+            returned = balance_data.get("returned", 0.0)
+            balance = balance_data.get("balance", 0.0)
 
-        await message.answer(
-            f"Текущий баланс:\n"
-            f"Потрачено: {spent:.2f} RUB\n"
-            f"Возвращено: {returned:.2f} RUB\n"
-            f"Остаток: {balance:.2f} RUB"
-        )
+            # Получаем дату обновления из A1 (опционально)
+            try:
+                date_result = sheets_service.spreadsheets().values().get(
+                    spreadsheetId=SHEET_NAME, range="Сводка!A1"
+                ).execute()
+                update_date = date_result.get("values", [[datetime.now().strftime("%d.%m.%Y")]])[0][0]
+            except Exception:
+                update_date = datetime.now().strftime("%d.%m.%Y")
+                logger.warning("Не удалось получить дату обновления из A1, используется текущая дата")
 
-        logger.info(
-            f"Баланс выдан: spent={spent}, returned={returned}, balance={balance}, user_id={message.from_user.id}"
-        )
-
+            await loading_message.edit_text(
+                f"💸 Текущий баланс:\n"
+                f"💰 Начальный баланс: {initial_balance:.2f} RUB\n"
+                f"➖ Потрачено: {spent:.2f} RUB\n"
+                f"➕ Возвращено: {returned:.2f} RUB\n"
+                f"🟰 Остаток: {balance:.2f} RUB",
+                parse_mode="Markdown"
+            )
+            logger.info(
+                f"Баланс выдан: initial_balance={initial_balance}, spent={spent}, returned={returned}, balance={balance}, user_id={message.from_user.id}"
+            )
+        else:
+            await loading_message.edit_text("❌ Ошибка получения данных о балансе.")
+            logger.error(f"Ошибка получения баланса: user_id={message.from_user.id}")
     except Exception as e:
-        await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.")
+        await loading_message.edit_text(f"❌ Неожиданная ошибка: {str(e)}. Проверьте /debug.")
         logger.error(f"Неожиданная ошибка /balance: {str(e)}, user_id={message.from_user.id}")

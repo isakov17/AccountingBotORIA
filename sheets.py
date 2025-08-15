@@ -233,65 +233,63 @@ async def save_receipt_summary(date, operation_type, sum_value, note):
         logger.error(f"Ошибка записи в Сводка: {e.status_code} - {e.reason}")
         raise
     except Exception as e:
-        logger.error(f"Неожиданная ошибка записи в Сводка: {str(e)}")
+        logger.error(f"Неожиданная ошибка записи в Сводка: {str(e)}.")
         raise
     
     
 async def get_monthly_balance():
     """
-    Получает общие траты, возвраты и баланс из листа 'Сводка'.
+    Получает начальный баланс из C2, остаток из I1, потрачено из L1, возвраты из O1.
     """
     try:
+        # Получаем данные из диапазона Сводка!C1:O2
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Сводка!A:E"
+            spreadsheetId=SHEET_NAME, range="Сводка!C1:O2"
         ).execute()
+        values = result.get("values", [])
 
-        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        # Начальный баланс из C2 (вторая строка, столбец C)
+        initial_balance_value = values[1][0] if len(values) > 1 and len(values[1]) > 0 else "0"
+        try:
+            initial_balance = float(initial_balance_value)
+        except (ValueError, TypeError):
+            logger.error(f"Некорректное значение начального баланса в C2: {initial_balance_value}")
+            initial_balance = 0.0
 
-        spent = 0.0
-        returned = 0.0
-        balance = 0.0
+        # Остаток из I1 (первая строка, столбец I, индекс 6)
+        balance_value = values[0][6] if len(values) > 0 and len(values[0]) > 6 else "0"
+        try:
+            balance = float(balance_value)
+        except (ValueError, TypeError):
+            logger.error(f"Некорректное значение остатка в I1: {balance_value}")
+            balance = 0.0
 
-        for row in rows:
-            if len(row) < 4:
-                continue  # Слишком мало столбцов
+        # Потрачено из L1 (первая строка, столбец L, индекс 9)
+        spent_value = values[0][9] if len(values) > 0 and len(values[0]) > 9 else "0"
+        try:
+            spent = float(spent_value)
+        except (ValueError, TypeError):
+            logger.error(f"Некорректное значение потраченного в L1: {spent_value}")
+            spent = 0.0
 
-            # Приход (столбец C)
-            income_str = row[2] if len(row) > 2 else ""
-            # Расход (столбец D)
-            expense_str = row[3] if len(row) > 3 else ""
-
-            operation_type = row[1] if len(row) > 1 else ""
-
-            # Обрабатываем приход
-            if income_str:
-                try:
-                    income = float(income_str)
-                    balance += income
-                    if operation_type == "Возврат":
-                        returned += income
-                except ValueError:
-                    logger.error(f"Некорректный приход: {income_str}, строка: {row}")
-
-            # Обрабатываем расход
-            if expense_str:
-                try:
-                    expense = float(expense_str)
-                    balance -= expense
-                    if operation_type == "Покупка":
-                        spent += expense
-                except ValueError:
-                    logger.error(f"Некорректный расход: {expense_str}, строка: {row}")
+        # Возвраты из O1 (первая строка, столбец O, индекс 12)
+        returned_value = values[0][12] if len(values) > 0 and len(values[0]) > 12 else "0"
+        try:
+            returned = float(returned_value)
+        except (ValueError, TypeError):
+            logger.error(f"Некорректное значение возвратов в O1: {returned_value}")
+            returned = 0.0
 
         return {
             "spent": round(spent, 2),
             "returned": round(returned, 2),
-            "balance": round(balance, 2)
+            "balance": round(balance, 2),
+            "initial_balance": round(initial_balance, 2)
         }
 
     except HttpError as e:
         logger.error(f"Ошибка получения баланса: {e.status_code} - {e.reason}")
-        return {"spent": 0.0, "returned": 0.0, "balance": 0.0}
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
     except Exception as e:
         logger.error(f"Ошибка получения баланса: {str(e)}")
-        return {"spent": 0.0, "returned": 0.0, "balance": 0.0}
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
