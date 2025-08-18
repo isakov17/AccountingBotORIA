@@ -34,7 +34,7 @@ async def start_command(message: Message):
     )
 
     # Второе сообщение — ссылка (отдельно!)
-    spreadsheet_link = "https://docs.google.com/spreadsheets/d/1AOeir1XEb6cY-z5joTKc6Vfsbr_TTbusJfPm40gcccs/edit?gid=738933579#gid=738933579"
+    spreadsheet_link = "https://docs.google.com/spreadsheets/d/1_ZAYirUBATf7VulZnzhGP3sMKM5-DljdR_fIfLFDCT8/edit?gid=738933579#gid=738933579"
     await message.answer(
         "📊 [Открыть таблицу расходов]({})".format(spreadsheet_link),
         parse_mode="Markdown"
