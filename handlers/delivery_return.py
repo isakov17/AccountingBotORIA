@@ -211,7 +211,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     loading_message = await callback.message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
     data = await state.get_data()
     receipt = data["receipt"]
-    parsed_data = data["parsed_data"]  # нужен для даты/магазина/qr/fiscalDoc/excluded_sum/excluded_items
+    parsed_data = data["parsed_data"]
     user_name = await is_user_allowed(callback.from_user.id)
     if not user_name:
         await loading_message.edit_text("🚫 Доступ запрещен.")
@@ -249,7 +249,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     if excluded_sum > 0:
         excluded_items_list = parsed_data.get("excluded_items", [])
         note = f"{parsed_data['fiscal_doc']} - Услуги ({', '.join(excluded_items_list)})"
-        await save_receipt_summary(parsed_data["date"], "Услуга", excluded_sum, note)  # Расход, поэтому сумма положительная в расходах
+        await save_receipt_summary(parsed_data["date"], "Услуга", excluded_sum, note)
         logger.info(f"Учёт услуг в Сводка: сумма={excluded_sum}, note={note}, user_id={callback.from_user.id}")
 
     # Получаем текущий баланс

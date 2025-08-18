@@ -13,20 +13,20 @@ creds = service_account.Credentials.from_service_account_info(
 )
 sheets_service = build('sheets', 'v4', credentials=creds)
 
-async def is_user_allowed(user_id):
+async def is_user_allowed(user_id: int) -> str | None:
     try:
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
         ).execute()
-        allowed_users = [int(row[0]) for row in result.get("values", [])[1:] if row and row[0].isdigit()]
-        logger.info(f"Проверка пользователя {user_id}. Разрешенные пользователи: {allowed_users}")
-        return user_id in allowed_users
-    except HttpError as e:
-        logger.error(f"Ошибка получения списка пользователей: {e.status_code} - {e.reason}")
-        return False
+        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        for row in rows:
+            if len(row) > 0 and str(row[0]) == str(user_id):
+                return row[1] if len(row) > 1 else f"User_{user_id}"  # Имя или заглушка
+        logger.info(f"Пользователь не найден в AllowedUsers: user_id={user_id}")
+        return None
     except Exception as e:
-        logger.error(f"Неожиданная ошибка получения списка пользователей: {str(e)}")
-        return False
+        logger.error(f"Ошибка проверки пользователя: {str(e)}, user_id={user_id}")
+        return None
 
 async def is_fiscal_doc_unique(fiscal_doc):
     try:
@@ -51,8 +51,7 @@ logger = logging.getLogger("AccountingBot")
 
 async def save_receipt(
     data_or_parsed=None,
-    username: str = "",
-    user_id: int | str = None,
+    user_name: str = "",
     customer: str | None = None,
     receipt_type: str = "Покупка",
     delivery_date: str | None = None,
@@ -81,7 +80,7 @@ async def save_receipt(
 
         if is_receipt_like:
             if not data.get("items") and data.get("excluded_sum", 0) <= 0:
-                logger.error(f"save_receipt: нет товаров и нет исключённой суммы, user_id={user_id}")
+                logger.error(f"save_receipt: нет товаров и нет исключённой суммы, user_name={user_name}")
                 return False
 
             fiscal_doc = data.get("fiscal_doc", "")
@@ -116,7 +115,7 @@ async def save_receipt(
                     added_at,
                     date_for_sheet,
                     item_sum,
-                    str(username or user_id),
+                    user_name,  # Записываем имя пользователя
                     store,
                     delivery_date_final or "",
                     status,
@@ -153,18 +152,18 @@ async def save_receipt(
                 )
                 logger.info(
                     f"Исключённые товары записаны в Сводка: сумма={data['excluded_sum']}, "
-                    f"позиции={data.get('excluded_items', [])}, user_id={user_id}"
+                    f"позиции={data.get('excluded_items', [])}, user_name={user_name}"
                 )
 
-            logger.info(f"Чек подтвержден: fiscal_doc={fiscal_doc}, user_id={user_id}")
+            logger.info(f"Чек подтвержден: fiscal_doc={fiscal_doc}, user_name={user_name}")
             return True
 
         else:
-            logger.error(f"save_receipt: неподдерживаемый формат данных, user_id={user_id}")
+            logger.error(f"save_receipt: неподдерживаемый формат данных, user_name={user_name}")
             return False
 
     except Exception as e:
-        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_id={user_id}")
+        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_name={user_name}")
         return False
 
 
