@@ -237,6 +237,20 @@ async def save_receipt_summary(date, operation_type, sum_value, note):
         raise
     
     
+def normalize_amount(value: str) -> float:
+    """
+    Приводит значение из Google Sheets к float (поддержка ',' и пробелов).
+    Если значение некорректное — возвращает 0.0.
+    """
+    if not value:
+        return 0.0
+    try:
+        return float(value.replace(" ", "").replace(",", "."))
+    except (ValueError, AttributeError):
+        logger.error(f"Некорректное число: {value}")
+        return 0.0
+
+
 async def get_monthly_balance():
     """
     Получает начальный баланс из C2, остаток из I1, потрачено из L1, возвраты из O1.
@@ -248,43 +262,27 @@ async def get_monthly_balance():
         ).execute()
         values = result.get("values", [])
 
-        # Начальный баланс из C2 (вторая строка, столбец C)
+        # Начальный баланс (C2)
         initial_balance_value = values[1][0] if len(values) > 1 and len(values[1]) > 0 else "0"
-        try:
-            initial_balance = float(initial_balance_value)
-        except (ValueError, TypeError):
-            logger.error(f"Некорректное значение начального баланса в C2: {initial_balance_value}")
-            initial_balance = 0.0
+        initial_balance = normalize_amount(initial_balance_value)
 
-        # Остаток из I1 (первая строка, столбец I, индекс 6)
+        # Остаток (I1, индекс 6)
         balance_value = values[0][6] if len(values) > 0 and len(values[0]) > 6 else "0"
-        try:
-            balance = float(balance_value)
-        except (ValueError, TypeError):
-            logger.error(f"Некорректное значение остатка в I1: {balance_value}")
-            balance = 0.0
+        balance = normalize_amount(balance_value)
 
-        # Потрачено из L1 (первая строка, столбец L, индекс 9)
+        # Потрачено (L1, индекс 9)
         spent_value = values[0][9] if len(values) > 0 and len(values[0]) > 9 else "0"
-        try:
-            spent = float(spent_value)
-        except (ValueError, TypeError):
-            logger.error(f"Некорректное значение потраченного в L1: {spent_value}")
-            spent = 0.0
+        spent = normalize_amount(spent_value)
 
-        # Возвраты из O1 (первая строка, столбец O, индекс 12)
+        # Возвраты (O1, индекс 12)
         returned_value = values[0][12] if len(values) > 0 and len(values[0]) > 12 else "0"
-        try:
-            returned = float(returned_value)
-        except (ValueError, TypeError):
-            logger.error(f"Некорректное значение возвратов в O1: {returned_value}")
-            returned = 0.0
+        returned = normalize_amount(returned_value)
 
         return {
             "spent": round(spent, 2),
             "returned": round(returned, 2),
             "balance": round(balance, 2),
-            "initial_balance": round(initial_balance, 2)
+            "initial_balance": round(initial_balance, 2),
         }
 
     except HttpError as e:

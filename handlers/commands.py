@@ -22,16 +22,24 @@ async def start_command(message: Message):
         await message.answer("🚫 Доступ запрещен.")
         logger.info(f"Доступ запрещен для user_id={message.from_user.id}")
         return
+
+    # Первое сообщение — приветствие и команды
     await message.answer(
         "👋 Добро пожаловать в *Бухгалтерия ОРИА*!\n\n"
         "*Доступные команды:*\n"
         "💰 `/balance` — Показать текущий баланс\n"
         "📥 `/add` — Добавить чек по QR-коду\n"
-        #"✍️ `/add_manual` — Добавить чек вручную\n"
         "✅ `/expenses` — Подтвердить доставку\n"
-        "🔙 `/return` — Обработать возврат\n"
-        #"🔔 `/disable_notifications [ФД_индекс]` — Отключить уведомления\n"
+        "🔙 `/return` — Обработать возврат"
     )
+
+    # Второе сообщение — ссылка (отдельно!)
+    spreadsheet_link = "https://docs.google.com/spreadsheets/d/1AOeir1XEb6cY-z5joTKc6Vfsbr_TTbusJfPm40gcccs/edit?gid=738933579#gid=738933579"
+    await message.answer(
+        "📊 [Открыть таблицу расходов]({})".format(spreadsheet_link),
+        parse_mode="Markdown"
+    )
+
     logger.info(f"Команда /start выполнена: user_id={message.from_user.id}")
     
 @router.message(lambda message: message.text == "Сброс")
