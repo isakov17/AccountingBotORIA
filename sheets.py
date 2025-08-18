@@ -134,7 +134,9 @@ async def save_receipt(
                     body={"values": [row]},
                 ).execute()
 
-                # Запись в Сводка
+            write_to_summary = (type_for_sheet in ("Покупка", "Полный")) and (status == "Доставлено")
+
+            if write_to_summary:
                 await save_receipt_summary(
                     date=date_for_sheet,
                     operation_type="Покупка",
