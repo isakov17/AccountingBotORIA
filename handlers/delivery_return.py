@@ -212,7 +212,13 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     receipt = data["receipt"]
     parsed_data = data["parsed_data"]  # нужен для даты/магазина/qr/fiscalDoc/excluded_sum/excluded_items
-    username = callback.from_user.username or str(callback.from_user.id)
+    user_name = await is_user_allowed(callback.from_user.id)
+    if not user_name:
+        await loading_message.edit_text("🚫 Доступ запрещен.")
+        logger.info(f"Доступ запрещен для confirm_add: user_id={callback.from_user.id}")
+        await state.clear()
+        await callback.answer()
+        return
     delivery_dates = receipt.get("delivery_dates", [])
 
     is_delivery = receipt.get("receipt_type") == "Предоплата"
@@ -223,7 +229,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         one = {
             "date": parsed_data["date"],
             "store": parsed_data.get("store", "Неизвестно"),
-            "items": [ {"name": item["name"], "sum": item["sum"]} ],
+            "items": [{"name": item["name"], "sum": item["sum"]}],
             "receipt_type": "Полный" if not is_delivery else "Доставка",
             "fiscal_doc": parsed_data["fiscal_doc"],
             "qr_string": parsed_data["qr_string"],
@@ -232,7 +238,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
             "customer": receipt.get("customer", data.get("customer", "Неизвестно")),
         }
 
-        saved = await save_receipt(one, username, callback.from_user.id, receipt_type=receipt_type_for_save)
+        saved = await save_receipt(one, user_name, callback.from_user.id, receipt_type=receipt_type_for_save)
         if saved:
             ok += 1
         else:
@@ -246,17 +252,32 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         await save_receipt_summary(parsed_data["date"], "Услуга", excluded_sum, note)  # Расход, поэтому сумма положительная в расходах
         logger.info(f"Учёт услуг в Сводка: сумма={excluded_sum}, note={note}, user_id={callback.from_user.id}")
 
+    # Получаем текущий баланс
+    balance_data = await get_monthly_balance()
+    balance = balance_data.get("balance", 0.0) if balance_data else 0.0
+
     # Редактируем сообщение загрузки на результат
     if ok and not fail:
-        await loading_message.edit_text(f"Чек {receipt['fiscal_doc']} добавлен. Позиции: {ok}/{ok}. Услуги учтены в балансе.")
+        await loading_message.edit_text(
+            f"✅ Чек {receipt['fiscal_doc']} добавлен (пользователь: {user_name}).\n"
+            f"Позиции: {ok}/{ok}. Услуги учтены в балансе.\n"
+            f"🟰 Текущий остаток: {balance:.2f} RUB",
+            parse_mode="Markdown"
+        )
     elif ok and fail:
-        await loading_message.edit_text(f"Чек {receipt['fiscal_doc']} добавлен частично. Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей. Услуги учтены в балансе.")
+        await loading_message.edit_text(
+            f"⚠️ Чек {receipt['fiscal_doc']} добавлен частично (пользователь: {user_name}).\n"
+            f"Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей. Услуги учтены в балансе.\n"
+            f"🟰 Текущий остаток: {balance:.2f} RUB",
+            parse_mode="Markdown"
+        )
     else:
-        await loading_message.edit_text(f"Не удалось сохранить чек {receipt['fiscal_doc']}. Попробуй ещё раз или /add_manual.")
+        await loading_message.edit_text(
+            f"❌ Не удалось сохранить чек {receipt['fiscal_doc']}. Попробуй ещё раз или /add_manual."
+        )
 
     logger.info(
-        "Чек подтвержден: fiscal_doc=%s, saved=%d, failed=%d, excluded_sum=%f, user_id=%s",
-        receipt['fiscal_doc'], ok, fail, excluded_sum, callback.from_user.id
+        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, excluded_sum={excluded_sum}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
     )
     await state.clear()
     await callback.answer()
