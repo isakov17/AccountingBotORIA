@@ -61,3 +61,16 @@ async def parse_qr_from_photo(bot, file_id):
             else:
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
+            
+import logging
+
+logger = logging.getLogger(__name__)
+
+def escape_markdown_v2(text: str) -> str:
+    """Экранирует специальные символы для Telegram MarkdownV2."""
+    special_chars = r'_[]()~`>#+=|{}.!-'  # Все специальные символы Telegram
+    escaped_text = text
+    for char in special_chars:
+        escaped_text = escaped_text.replace(char, f'\\{char}')
+    logger.debug(f"MarkdownV2: Before escaping: '{text}', After escaping: '{escaped_text}'")
+    return escaped_text

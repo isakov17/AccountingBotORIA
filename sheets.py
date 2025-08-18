@@ -290,3 +290,17 @@ async def get_monthly_balance():
     except Exception as e:
         logger.error(f"Ошибка получения баланса: {str(e)}")
         return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
+    
+    
+async def get_sheet_id(spreadsheet_id: str, sheet_name: str) -> int:
+    try:
+        result = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = result.get("sheets", [])
+        for sheet in sheets:
+            if sheet["properties"]["title"] == sheet_name:
+                return sheet["properties"]["sheetId"]
+        logger.error(f"Лист {sheet_name} не найден в таблице {spreadsheet_id}")
+        raise ValueError(f"Лист {sheet_name} не найден")
+    except Exception as e:
+        logger.error(f"Ошибка при получении sheetId для {sheet_name}: {str(e)}")
+        raise
