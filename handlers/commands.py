@@ -3,7 +3,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from sheets import sheets_service, is_user_allowed
-from config import SHEET_NAME, PROVERKACHEKA_TOKEN, YOUR_ADMIN_ID
+from config import SHEET_NAME, PROVERKACHEKA_TOKEN, YOUR_ADMIN_ID, SPREADSHEETS_LINK
 from exceptions import (
     get_excluded_items,
     add_excluded_item,
@@ -34,9 +34,8 @@ async def start_command(message: Message):
     )
 
     # Второе сообщение — ссылка (отдельно!)
-    spreadsheet_link = "https://docs.google.com/spreadsheets/d/1_ZAYirUBATf7VulZnzhGP3sMKM5-DljdR_fIfLFDCT8/edit?gid=738933579#gid=738933579"
     await message.answer(
-        "📊 [Открыть таблицу расходов]({})".format(spreadsheet_link),
+        "📊 [Открыть таблицу расходов]({})".format(SPREADSHEETS_LINK),
         parse_mode="Markdown"
     )
 

@@ -13,6 +13,7 @@ SHEET_NAME = os.getenv("SHEET_NAME")
 PROVERKACHEKA_TOKEN = os.getenv("PROVERKACHEKA_TOKEN")
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SPREADSHEETS_LINK= os.getenv("spreadsheet_link")
 
 # Загрузка Google Credentials из файла credentials.json
 try:
