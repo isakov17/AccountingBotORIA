@@ -41,56 +41,54 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 # 🔽 ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ФОТО QR, ЕСЛИ ПОЛЬЗОВАТЕЛЬ НЕ ВОШЕЛ В /add
 @router.message(StateFilter(None), F.photo)
 async def catch_qr_photo_without_command(message: Message, state: FSMContext, bot: Bot):
-    """
-    Пользователь прислал фото с QR не заходя в /add — запускаем тот же флоу,
-    что и @router.message(AddReceiptQR.UPLOAD_QR).
-    """
-    # Проверяем доступ
     if not await is_user_allowed(message.from_user.id):
-        await message.answer("Доступ запрещен.")
+        await message.answer("🚫 Доступ запрещен.")
         logger.info(f"Доступ запрещен для авто-обработки QR: user_id={message.from_user.id}")
         return
 
-    # Пробуем распарсить QR
+    # показываем индикатор обработки
+    loading = await message.answer("⌛ Обрабатываю фото чека...")
+
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
-    keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Сброс")]],
+        resize_keyboard=True
+    )
 
     if not parsed_data:
-        await message.answer(
-            "Ошибка обработки QR-кода. Убедитесь, что QR-код четкий, "
-            "или используйте /add для ручного старта.",
-            reply_markup=keyboard
+        await loading.edit_text(
+            "❌ Не удалось распознать QR. "
+            "Убедитесь, что QR-код четкий, или используйте /add."
         )
         logger.error(f"Авто-QR: распознавание не удалось, user_id={message.from_user.id}")
-        # На всякий случай чистим состояние (вдруг было что-то «битое»)
         await state.clear()
         return
 
-    # Проверяем уникальность фискального номера (точно как в обычном /add)
-    # см. process_qr_upload: проверка is_fiscal_doc_unique и ветвление ответов
     if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
-        await message.answer(
-            f"Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует.",
-            reply_markup=keyboard
+        await loading.edit_text(
+            f"❌ Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует."
         )
-        logger.info(f"Авто-QR: дубликат фискального номера: {parsed_data['fiscal_doc']}, user_id={message.from_user.id}")
+        logger.info(
+            f"Авто-QR: дубликат фискального номера {parsed_data['fiscal_doc']}, user_id={message.from_user.id}"
+        )
         await state.clear()
         return
 
-    # Сохраняем данные и переводим пользователя в тот же шаг, что и после /add -> UPLOAD_QR
+    # успешный парсинг — обновляем сообщение и переводим в CUSTOMER
+    await loading.edit_text("✅ QR-код распознан.\nВведите заказчика (или /skip):",
+                            reply_markup=keyboard)
+
     await state.update_data(
         username=message.from_user.username or str(message.from_user.id),
         parsed_data=parsed_data
     )
-
-    # Дальше — в точности как в твоём process_qr_upload: спрашиваем заказчика и ставим состояние CUSTOMER
-    await message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
     await state.set_state(AddReceiptQR.CUSTOMER)
 
     logger.info(
         "Авто-старт /add по фото QR: fiscal_doc=%s, user_id=%s",
         parsed_data['fiscal_doc'], message.from_user.id
     )
+
 
 
 @router.message(Command("add"))
