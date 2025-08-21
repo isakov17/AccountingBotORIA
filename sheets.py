@@ -188,7 +188,7 @@ async def save_receipt_summary(date, operation_type, sum_value, note):
 
         # Получаем текущие данные
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Сводка!A:F"
+            spreadsheetId=SHEET_NAME, range="Сводка!A:E"
         ).execute()
         rows = result.get("values", [])
         
@@ -217,13 +217,12 @@ async def save_receipt_summary(date, operation_type, sum_value, note):
             operation_type,
             income,
             expense,
-            new_balance,
             note
         ]
 
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SHEET_NAME,
-            range="Сводка!A:F",
+            range="Сводка!A:E",
             valueInputOption="RAW",
             body={"values": [summary_row]}
         ).execute()
