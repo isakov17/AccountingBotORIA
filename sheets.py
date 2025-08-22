@@ -59,8 +59,9 @@ async def save_receipt(
     **kwargs
 ):
     """Сохраняет чек в Google Sheets:
-    - Исключённые товары не попадают в 'Чеки', но идут в 'Сводка'
-    - Остальные товары сохраняются в оба листа
+    - Все товары пишутся в 'Чеки'
+    - Все товары параллельно пишутся в 'Сводка'
+    - Исключённые товары пишутся только в 'Сводка' как 'Услуга'
     """
 
     if data_or_parsed is None:
@@ -70,7 +71,6 @@ async def save_receipt(
             data_or_parsed = kwargs["receipt"]
 
     try:
-        # Определяем формат входных данных
         is_receipt_like = isinstance(data_or_parsed, dict) and (
             "status" in data_or_parsed
             or "receipt_type" in data_or_parsed
@@ -115,7 +115,7 @@ async def save_receipt(
                     added_at,
                     date_for_sheet,
                     item_sum,
-                    user_name,  # Записываем имя пользователя
+                    user_name,
                     store,
                     delivery_date_final or "",
                     status,
@@ -134,22 +134,20 @@ async def save_receipt(
                     body={"values": [row]},
                 ).execute()
 
-            write_to_summary = (type_for_sheet in ("Покупка", "Полный")) and (status == "Доставлено")
-
-            if write_to_summary:
+                # 👇 Дублируем в Сводка
                 await save_receipt_summary(
                     date=date_for_sheet,
-                    operation_type="Покупка",
+                    operation_type="Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
                     sum_value=-abs(item_sum),
                     note=f"{fiscal_doc} - {item_name}"
                 )
 
-            # Если есть исключённые товары — только в Сводка
+            # Исключённые товары — только в Сводка
             if data.get("excluded_sum", 0) > 0:
                 await save_receipt_summary(
                     date=date_for_sheet,
                     operation_type="Услуга",
-                    sum_value=abs(data["excluded_sum"]),
+                    sum_value=-abs(data["excluded_sum"]),
                     note=f"{fiscal_doc} - Исключённые позиции: {', '.join(data.get('excluded_items', []))}"
                 )
                 logger.info(
@@ -167,6 +165,8 @@ async def save_receipt(
     except Exception as e:
         logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_name={user_name}")
         return False
+
+
 
 
 async def save_receipt_summary(date, operation_type, sum_value, note):

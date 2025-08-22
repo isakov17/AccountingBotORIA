@@ -1,6 +1,5 @@
 from aiogram import Bot, Dispatcher
 from handlers.commands import router as commands_router
-from handlers.receipt import router as receipt_router
 from handlers.delivery_return import router as delivery_return_router
 from handlers.notifications import send_notifications
 import asyncio
@@ -14,7 +13,6 @@ dp = Dispatcher()
 
 # Регистрация роутеров
 dp.include_router(commands_router)
-dp.include_router(receipt_router)
 dp.include_router(delivery_return_router)
 
 # Запуск уведомлений

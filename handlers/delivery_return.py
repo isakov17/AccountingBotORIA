@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
 from sheets import sheets_service, is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, save_receipt_summary
-from utils import parse_qr_from_photo
+from utils import parse_qr_from_photo, confirm_manual_api
 from googleapiclient.errors import HttpError
 import logging
 from datetime import datetime
@@ -27,11 +27,23 @@ class ConfirmDelivery(StatesGroup):
     SELECT_ITEMS = State()     # мультивыбор позиций в чеке
     UPLOAD_FULL_QR = State()   # загрузка QR полного расчёта
     CONFIRM_ACTION = State()   # финальное подтверждение
+
 class ReturnReceipt(StatesGroup):
     ENTER_FISCAL_DOC = State()
     SELECT_ITEM = State()
     UPLOAD_RETURN_QR = State()
     CONFIRM_ACTION = State()
+
+class AddManualAPI(StatesGroup):
+    FN = State()
+    FD = State()
+    FP = State()
+    SUM = State()
+    DATE = State()
+    TIME = State()
+    TYPE = State()
+    CONFIRM = State()
+
 
 # 🔽 ДОБАВЬ К ИМПОРТАМ ВВЕРХУ ФАЙЛА
 from aiogram import F
@@ -46,49 +58,82 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
         logger.info(f"Доступ запрещен для авто-обработки QR: user_id={message.from_user.id}")
         return
 
-    # показываем индикатор обработки
     loading = await message.answer("⌛ Обрабатываю фото чека...")
 
-    parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Сброс")]],
-        resize_keyboard=True
-    )
-
-    if not parsed_data:
-        await loading.edit_text(
-            "❌ Не удалось распознать QR. "
-            "Убедитесь, что QR-код четкий, или используйте /add."
+    try:
+        parsed_data = await asyncio.wait_for(
+            parse_qr_from_photo(bot, message.photo[-1].file_id),
+            timeout=10.0
         )
-        logger.error(f"Авто-QR: распознавание не удалось, user_id={message.from_user.id}")
-        await state.clear()
-        return
 
-    if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
-        await loading.edit_text(
-            f"❌ Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует."
+        if not parsed_data:
+            inline_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="goto_add_manual")]]
+            )
+            await loading.edit_text(
+                "❌ QR-код не удалось распознать. Возможно, превышено количество обращений по чеку.\n"
+                "Вы можете попробовать снова или добавить чек вручную:",
+                reply_markup=inline_keyboard
+            )
+            logger.error(f"Не удалось распознать QR-код: user_id={message.from_user.id}")
+            await state.clear()
+            return
+
+        if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
+            await loading.edit_text(
+                f"❌ Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует."
+            )
+            logger.info(
+                f"Авто-QR: дубликат фискального номера {parsed_data['fiscal_doc']}, user_id={message.from_user.id}"
+            )
+            await state.clear()
+            return
+
+        await loading.edit_text("✅ QR-код распознан.")
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Сброс")]],
+            resize_keyboard=True
         )
+        await message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
+        await state.update_data(
+            username=message.from_user.username or str(message.from_user.id),
+            parsed_data=parsed_data
+        )
+        await state.set_state(AddReceiptQR.CUSTOMER)
         logger.info(
-            f"Авто-QR: дубликат фискального номера {parsed_data['fiscal_doc']}, user_id={message.from_user.id}"
+            f"Авто-старт /add по фото QR: fiscal_doc={parsed_data['fiscal_doc']}, "
+            f"qr_string={parsed_data['qr_string']}, user_id={message.from_user.id}"
         )
+
+    except asyncio.TimeoutError:
+        inline_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="goto_add_manual")]]
+        )
+        await loading.edit_text(
+            "❌ Превышено время обработки QR-кода. Попробуйте снова или добавьте чек вручную:",
+            reply_markup=inline_keyboard
+        )
+        logger.error(f"Таймаут при обработке QR-кода: user_id={message.from_user.id}")
         await state.clear()
-        return
+    except Exception as e:
+        inline_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="goto_add_manual")]]
+        )
+        await loading.edit_text(
+            f"⚠️ Ошибка при обработке фото: {str(e)}. Возможно, превышено количество обращений по чеку.\n"
+            "Попробуйте снова или добавьте чек вручную:",
+            reply_markup=inline_keyboard
+        )
+        logger.error(f"Ошибка обработки фото чека: {str(e)}, user_id={message.from_user.id}")
+        await state.clear()
 
-    # успешный парсинг — обновляем сообщение и переводим в CUSTOMER
-    await loading.edit_text("✅ QR-код распознан.\nВведите заказчика (или /skip):",
-                            reply_markup=keyboard)
 
-    await state.update_data(
-        username=message.from_user.username or str(message.from_user.id),
-        parsed_data=parsed_data
-    )
-    await state.set_state(AddReceiptQR.CUSTOMER)
 
-    logger.info(
-        "Авто-старт /add по фото QR: fiscal_doc=%s, user_id=%s",
-        parsed_data['fiscal_doc'], message.from_user.id
-    )
-
+@router.callback_query(lambda c: c.data == "goto_add_manual")
+async def goto_add_manual(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await add_manual_start(callback.message, state)  # запускаем как если бы /add_manual
+    await callback.answer()
 
 
 @router.message(Command("add"))
@@ -101,6 +146,15 @@ async def start_add_receipt(message: Message, state: FSMContext):
     await message.answer("Отправьте фото QR-кода чека.")
     await state.set_state(AddReceiptQR.UPLOAD_QR)
     logger.info(f"Начало добавления чека по QR: user_id={message.from_user.id}")
+
+@router.message(Command("add_manual"))
+async def add_manual_start(message: Message, state: FSMContext):
+    if not await is_user_allowed(message.from_user.id):
+        await message.answer("🚫 Доступ запрещен.")
+        return
+    await message.answer("Введите *ФН* (номер фискального накопителя):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.FN)
+
 
 @router.message(AddReceiptQR.UPLOAD_QR)
 async def process_qr_upload(message: Message, state: FSMContext, bot: Bot):
@@ -294,6 +348,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
             "delivery_date": delivery_dates[i] if i < len(delivery_dates) else "",
             "status": "Ожидает" if is_delivery else "Доставлено",
             "customer": receipt.get("customer", data.get("customer", "Неизвестно")),
+            "excluded_sum": parsed_data.get("excluded_sum", 0.0),
+            "excluded_items": parsed_data.get("excluded_items", [])
         }
 
         saved = await save_receipt(one, user_name, callback.from_user.id, receipt_type=receipt_type_for_save)
@@ -301,14 +357,6 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
             ok += 1
         else:
             fail += 1
-
-    # Добавление записи для excluded_sum в Сводка как расход на услуги
-    excluded_sum = parsed_data.get("excluded_sum", 0.0)
-    if excluded_sum > 0:
-        excluded_items_list = parsed_data.get("excluded_items", [])
-        note = f"{parsed_data['fiscal_doc']} - Услуги ({', '.join(excluded_items_list)})"
-        await save_receipt_summary(parsed_data["date"], "Услуга", excluded_sum, note)
-        logger.info(f"Учёт услуг в Сводка: сумма={excluded_sum}, note={note}, user_id={callback.from_user.id}")
 
     # Получаем текущий баланс
     balance_data = await get_monthly_balance()
@@ -318,14 +366,14 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     if ok and not fail:
         await loading_message.edit_text(
             f"✅ Чек {receipt['fiscal_doc']} добавлен (пользователь: {user_name}).\n"
-            f"Позиции: {ok}/{ok}. Услуги учтены в балансе.\n"
+            f"Позиции: {ok}/{ok}.\n"
             f"🟰 Текущий остаток: {balance:.2f} RUB",
             parse_mode="Markdown"
         )
     elif ok and fail:
         await loading_message.edit_text(
             f"⚠️ Чек {receipt['fiscal_doc']} добавлен частично (пользователь: {user_name}).\n"
-            f"Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей. Услуги учтены в балансе.\n"
+            f"Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей.\n"
             f"🟰 Текущий остаток: {balance:.2f} RUB",
             parse_mode="Markdown"
         )
@@ -335,10 +383,11 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         )
 
     logger.info(
-        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, excluded_sum={excluded_sum}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
+        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
     )
     await state.clear()
     await callback.answer()
+
 
 
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "cancel_add")
@@ -978,3 +1027,130 @@ async def get_balance(message: Message):
     except Exception as e:
         await loading_message.edit_text(f"❌ Неожиданная ошибка: {str(e)}. Проверьте /debug.")
         logger.error(f"Неожиданная ошибка /balance: {str(e)}, user_id={message.from_user.id}")
+
+
+@router.message(AddManualAPI.FN)
+async def add_manual_fn(message: Message, state: FSMContext):
+    await state.update_data(fn=message.text.strip())
+    await message.answer("Введите *ФД* (номер фискального документа):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.FD)
+
+@router.message(AddManualAPI.FD)
+async def add_manual_fd(message: Message, state: FSMContext):
+    await state.update_data(fd=message.text.strip())
+    await message.answer("Введите *ФП/ФПД* (фискальный признак документа):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.FP)
+
+@router.message(AddManualAPI.FP)
+async def add_manual_fp(message: Message, state: FSMContext):
+    await state.update_data(fp=message.text.strip())
+    await message.answer("Введите *итоговую сумму* (например: 123.45):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.SUM)
+
+@router.message(AddManualAPI.SUM)
+async def add_manual_sum(message: Message, state: FSMContext):
+    try:
+        await state.update_data(s=float(message.text.replace(",", ".")))
+        await message.answer("Введите *дату* чека (ММДДГГ, например 210225):", parse_mode="Markdown")
+        await state.set_state(AddManualAPI.DATE)
+    except ValueError:
+        await message.answer("Неверный формат суммы. Попробуйте ещё раз.")
+
+@router.message(AddManualAPI.DATE)
+async def add_manual_date(message: Message, state: FSMContext):
+    await state.update_data(date=message.text.strip())
+    await message.answer("Введите *время* чека (ЧЧ:ММ):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.TIME)
+
+@router.message(AddManualAPI.TIME)
+async def add_manual_time(message: Message, state: FSMContext):
+    await state.update_data(time=message.text.strip())
+    await message.answer("Введите *тип операции* (приход, возврат прихода, расход, возврат расхода):", parse_mode="Markdown")
+    await state.set_state(AddManualAPI.TYPE)
+
+@router.message(AddManualAPI.TYPE)
+async def add_manual_type(message: Message, state: FSMContext):
+    await state.update_data(op_type=message.text.strip())
+    data = await state.get_data()
+
+    details = (
+        f"Проверьте данные чека:\n"
+        f"ФН: {data['fn']}\n"
+        f"ФД: {data['fd']}\n"
+        f"ФП: {data['fp']}\n"
+        f"Сумма: {data['s']}\n"
+        f"Дата: {data['date']}\n"
+        f"Время: {data['time']}\n"
+        f"Тип: {data['op_type']}\n\n"
+        f"Подтвердить запрос к proverkacheka.com?"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_manual_api")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_manual_api")]
+    ])
+    await message.answer(details, reply_markup=kb)
+    await state.set_state(AddManualAPI.CONFIRM)
+
+
+# === Обработчик подтверждения чека через ручной ввод (API) ===
+@router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "confirm_manual_api")
+async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    loading = await callback.message.answer("⌛ Запрашиваю данные чека через API...")
+
+    try:
+        # Добавляем таймаут для confirm_manual_api
+        success, msg, parsed_data = await asyncio.wait_for(
+            confirm_manual_api(data, callback.from_user),
+            timeout=10.0
+        )
+
+        if not success or not parsed_data:
+            await loading.edit_text(msg)
+            await state.clear()
+            await callback.answer()
+            return
+
+        await loading.edit_text("✅ Чек получен.")
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Сброс")]],
+            resize_keyboard=True
+        )
+        await callback.message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
+
+        await state.update_data(
+            username=callback.from_user.username or str(callback.from_user.id),
+            parsed_data=parsed_data
+        )
+        await state.set_state(AddReceiptQR.CUSTOMER)
+
+        logger.info(
+            f"Manual API чек подтверждён: fiscal_doc={parsed_data['fiscal_doc']}, "
+            f"qr_string={parsed_data['qr_string']}, user_id={callback.from_user.id}"
+        )
+        await callback.answer()
+
+    except asyncio.TimeoutError:
+        await loading.edit_text(
+            "❌ Превышено время запроса к API. Попробуйте снова или добавьте чек вручную: /add_manual"
+        )
+        logger.error(f"Таймаут при запросе к API: user_id={callback.from_user.id}")
+        await state.clear()
+        await callback.answer()
+    except Exception as e:
+        await loading.edit_text(
+            f"⚠️ Ошибка при запросе к API: {str(e)}. Проверьте /debug."
+        )
+        logger.error(f"Ошибка при запросе к API: {str(e)}, user_id={callback.from_user.id}")
+        await state.clear()
+        await callback.answer()
+
+
+
+@router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "cancel_manual_api")
+async def cancel_manual_api_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Добавление чека отменено. Начать заново: /add_manual")
+    await state.clear()
+    await callback.answer()
+
