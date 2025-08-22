@@ -656,23 +656,22 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    items    = data.get("items", [])
+    items = data.get("items", [])
     selected = sorted(list(data.get("selected", set())))
     sel_items = [items[i] for i in selected]
-    parsed   = data.get("qr_parsed", {})
+    parsed = data.get("qr_parsed", {})
 
-    new_fd  = parsed.get("fiscal_doc", "")
-    qr_str  = parsed.get("qr_string", "")
+    new_fd = parsed.get("fiscal_doc", "")
+    qr_str = parsed.get("qr_string", "")
 
     ok, fail = 0, 0
     errors = []
 
-    # ВАЖНО: для подтверждения доставки мы НЕ требуем уникальности fiscal_doc —
-    # один и тот же номер у нескольких строк допустим.
+    # Обновляем строки в «Чеки» без записи в «Сводка»
     for it in sel_items:
         row_index = it["row_index"]
         try:
-            # читаем текущую строку
+            # Читаем текущую строку
             res = sheets_service.spreadsheets().values().get(
                 spreadsheetId=SHEET_NAME, range=f"Чеки!A{row_index}:M{row_index}"
             ).execute()
@@ -680,11 +679,11 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             while len(row) < 13:
                 row.append("")
 
-            # обновляем поля — РОВНО КАК В ТВОЕЙ ЛОГИКЕ:
-            row[6]  = "Доставлено"    # G: статус
-            row[9]  = "Полный"        # J: тип чека
-            row[10] = str(new_fd)     # K: fiscal_doc полного чека
-            row[11] = qr_str          # L: QR-строка полного расчёта
+            # Обновляем поля
+            row[6] = "Доставлено"  # G: статус
+            row[9] = "Полный"      # J: тип чека
+            row[10] = str(new_fd)  # K: fiscal_doc полного чека
+            row[11] = qr_str       # L: QR-строка полного расчёта
 
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SHEET_NAME,
@@ -693,15 +692,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
                 body={"values": [row]}
             ).execute()
 
-            # запись в «Сводка»: Покупка, отрицательная сумма, примечание "{fd} - {item_name}"
-            date_for_summary = row[1] if len(row) > 1 and row[1] else row[0]
-            await save_receipt_summary(
-                date=date_for_summary,
-                operation_type="Покупка",
-                sum_value=-abs(float(it["sum"])),
-                note=f"{new_fd} - {it['name']}"
-            )
-
+            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}, qr_string={qr_str}")
             ok += 1
         except HttpError as e:
             fail += 1
@@ -710,7 +701,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             fail += 1
             errors.append(f"Строка {row_index}: {str(e)}")
 
-    # баланс после записей
+    # Баланс после обновления
     try:
         balance_data = await get_monthly_balance()
         balance = balance_data.get("balance", 0.0) if balance_data else 0.0
@@ -719,7 +710,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
 
     if fail == 0:
         await callback.message.edit_text(
-            f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}.\n🟰 Текущий остаток: {balance:.2f} RUB"
+            f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}."
         )
     else:
         details = "\n".join(errors[:10])

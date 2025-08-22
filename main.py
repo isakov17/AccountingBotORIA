@@ -1,6 +1,6 @@
 from aiogram import Bot, Dispatcher
 from handlers.commands import router as commands_router
-from handlers.delivery_return import router as delivery_return_router
+from handlers.routers import router as routers
 from handlers.notifications import send_notifications
 import asyncio
 from config import TELEGRAM_TOKEN
@@ -13,7 +13,7 @@ dp = Dispatcher()
 
 # Регистрация роутеров
 dp.include_router(commands_router)
-dp.include_router(delivery_return_router)
+dp.include_router(routers)
 
 # Запуск уведомлений
 async def on_startup():
