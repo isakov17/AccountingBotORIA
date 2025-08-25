@@ -1,6 +1,10 @@
 from config import SHEET_NAME, PROVERKACHEKA_TOKEN
 from aiogram import Router, Bot
 from aiogram.filters import Command
+# 🔽 ДОБАВЬ К ИМПОРТАМ ВВЕРХУ ФАЙЛА
+from aiogram import F
+from aiogram.filters import StateFilter
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
@@ -44,11 +48,18 @@ class AddManualAPI(StatesGroup):
     TYPE = State()
     CONFIRM = State()
 
+def reset_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Сброс")]],
+        resize_keyboard=True
+    )
 
-# 🔽 ДОБАВЬ К ИМПОРТАМ ВВЕРХУ ФАЙЛА
-from aiogram import F
-from aiogram.filters import StateFilter
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+@router.message(F.text.casefold() == "сброс")
+async def reset_action(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🔄 Действие сброшено. Вы можете начать заново.", reply_markup=ReplyKeyboardRemove())
+    logger.info(f"Сброс состояний: user_id={message.from_user.id}")
+
 
 # 🔽 ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ФОТО QR, ЕСЛИ ПОЛЬЗОВАТЕЛЬ НЕ ВОШЕЛ В /add
 @router.message(StateFilter(None), F.photo)
@@ -90,11 +101,7 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
             return
 
         await loading.edit_text("✅ QR-код распознан.")
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]],
-            resize_keyboard=True
-        )
-        await message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
+        await message.answer("Введите заказчика (или /skip):", reply_markup=reset_keyboard())
         await state.update_data(
             username=message.from_user.username or str(message.from_user.id),
             parsed_data=parsed_data
@@ -152,34 +159,30 @@ async def add_manual_start(message: Message, state: FSMContext):
     if not await is_user_allowed(message.from_user.id):
         await message.answer("🚫 Доступ запрещен.")
         return
-    await message.answer("Введите *ФН* (номер фискального накопителя):", parse_mode="Markdown")
+    await message.answer("Введите *ФН* (номер фискального накопителя):", reply_markup=reset_keyboard())
     await state.set_state(AddManualAPI.FN)
 
 
 @router.message(AddReceiptQR.UPLOAD_QR)
 async def process_qr_upload(message: Message, state: FSMContext, bot: Bot):
     if not message.photo:
-        keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-        await message.answer("Пожалуйста, отправьте фото QR-кода чека.", reply_markup=keyboard)
+        await message.answer("Пожалуйста, отправьте фото QR-кода чека.", reply_markup=reset_keyboard())
         logger.info(f"Фото отсутствует для QR: user_id={message.from_user.id}")
         return
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed_data:
-        keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-        await message.answer("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий, или используйте /add_manual для ручного ввода.", reply_markup=keyboard)
+        await message.answer("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий, или используйте /add_manual для ручного ввода.", reply_markup=reset_keyboard())
         logger.error(f"Ошибка обработки QR-кода: user_id={message.from_user.id}")
         await state.clear()
         return
     if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
-        keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-        await message.answer(f"Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует.", reply_markup=keyboard)
+        await message.answer(f"Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует.", reply_markup=reset_keyboard())
         logger.info(f"Дубликат фискального номера: {parsed_data['fiscal_doc']}, user_id={message.from_user.id}")
         await state.clear()
         return
     loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
     await state.update_data(parsed_data=parsed_data)
-    keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-    await message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
+    await message.answer("Введите заказчика (или /skip):", reply_markup=reset_keyboard())
     await state.set_state(AddReceiptQR.CUSTOMER)
     await loading_message.edit_text("QR-код обработан.")
     logger.info(f"QR-код обработан: fiscal_doc={parsed_data['fiscal_doc']}, user_id={message.from_user.id}")
@@ -192,9 +195,8 @@ async def process_customer(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="Доставка", callback_data="type_delivery")],
         [InlineKeyboardButton(text="Покупка в магазине", callback_data="type_store")]
     ])
-    reply_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
     await message.answer("Это доставка или покупка в магазине?", reply_markup=inline_keyboard)
-    await message.answer("Или сбросьте действие:", reply_markup=reply_keyboard)
+    await message.answer("Или сбросьте действие:", reply_markup=reset_keyboard())
     await state.set_state(AddReceiptQR.SELECT_TYPE)
     logger.info(f"Заказчик принят: {customer}, user_id={message.from_user.id}")
 
@@ -261,8 +263,7 @@ async def process_delivery_date(message: Message, state: FSMContext):
     else:
         date_pattern = r"^\d{6}$"  # Проверяем, что введено ровно 6 цифр
         if not re.match(date_pattern, message.text):
-            keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=keyboard)
+            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=reset_keyboard())
             return
         try:
             day = message.text[0:2]
@@ -274,8 +275,7 @@ async def process_delivery_date(message: Message, state: FSMContext):
             datetime.strptime(normalized_date, "%d.%m.%Y")
             delivery_date = normalized_date
         except ValueError:
-            keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=keyboard)
+            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=reset_keyboard())
             return
 
     delivery_dates.append(delivery_date)
@@ -283,8 +283,7 @@ async def process_delivery_date(message: Message, state: FSMContext):
 
     if current_item_index + 1 < len(items):
         await state.update_data(current_item_index=current_item_index + 1)
-        keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
-        await message.answer(f"Введите дату доставки для {items[current_item_index + 1]['name']} (ддммгг, например 110825 для 11.08.2025) или /skip:", reply_markup=keyboard)
+        await message.answer(f"Введите дату доставки для {items[current_item_index + 1]['name']} (ддммгг, например 110825 для 11.08.2025) или /skip:", reply_markup=reset_keyboard())
         return
 
     total_sum = sum(item["sum"] for item in items)
@@ -312,9 +311,8 @@ async def process_delivery_date(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
     ])
-    reply_keyboard = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True)
     await message.answer(details, reply_markup=inline_keyboard)
-    await message.answer("Или сбросьте действие:", reply_markup=reply_keyboard)
+    await message.answer("Или сбросьте действие:", reply_markup=reset_keyboard())
     await state.update_data(receipt=receipt)
     await state.set_state(AddReceiptQR.CONFIRM_ACTION)
 
@@ -611,23 +609,21 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
     missing = []
     for it in sel_items:
         need_name = _norm_name(it["name"])
-        need_sum  = float(it["sum"])
         matched = False
         for q in qr_items:
             q_name = _norm_name(q.get("name", ""))
             if not q_name:
                 continue
             if q_name == need_name or (need_name in q_name or q_name in need_name):
-                q_sum = _item_sum_from_qr(q)
-                if abs(q_sum - need_sum) <= 0.02:
-                    matched = True
-                    break
+                matched = True
+                break
         if not matched:
-            missing.append(f"{it['name']} ({it['sum']:.2f})")
+            missing.append(it["name"])
 
     if missing:
         await loading.edit_text(
-            "❌ Проверка провалена. Не найдены в QR (или суммы не совпали):\n• " + "\n• ".join(missing)
+            "❌ Проверка провалена. Не найдены в QR:\n• " + "\n• ".join(missing),
+            reply_markup=reset_keyboard()
         )
         return
 
@@ -734,29 +730,16 @@ async def return_receipt(message: Message, state: FSMContext):
         return
     
     # Запрашиваем у пользователя фискальный номер
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Сброс")]],
-        resize_keyboard=True
-    )
-    await message.answer("Пожалуйста, введите фискальный номер чека для возврата:", reply_markup=keyboard)
+    await message.answer("Пожалуйста, введите фискальный номер чека для возврата:", reply_markup=reset_keyboard())
     await state.set_state(ReturnReceipt.ENTER_FISCAL_DOC)
     logger.info(f"Запрос фискального номера для /return: user_id={message.from_user.id}")
 
 @router.message(ReturnReceipt.ENTER_FISCAL_DOC)
 async def process_fiscal_doc(message: Message, state: FSMContext):
     fiscal_doc = message.text.strip()
-    if fiscal_doc == "Сброс":
-        await message.answer("Действие сброшено.", reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        logger.info(f"Сброс действия для /return: user_id={message.from_user.id}")
-        return
 
     if not fiscal_doc.isdigit() or len(fiscal_doc) > 20:
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]],
-            resize_keyboard=True
-        )
-        await message.answer("Фискальный номер должен содержать только цифры и быть не длиннее 20 символов.", reply_markup=keyboard)
+        await message.answer("Фискальный номер должен содержать только цифры и быть не длиннее 20 символов.", reply_markup=reset_keyboard())
         logger.info(f"Некорректный фискальный номер для /return: {fiscal_doc}, user_id={message.from_user.id}")
         return
 
@@ -766,11 +749,7 @@ async def process_fiscal_doc(message: Message, state: FSMContext):
         ).execute()
         receipts = [row for row in result.get("values", [])[1:] if len(row) > 10 and row[10] == fiscal_doc and row[6] != "Возвращен"]
         if not receipts:
-            keyboard = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Сброс")]],
-                resize_keyboard=True
-            )
-            await message.answer("Чеки не найдены или уже возвращены.", reply_markup=keyboard)
+            await message.answer("Чеки не найдены или уже возвращены.", reply_markup=reset_keyboard())
             logger.info(f"Чеки не найдены для /return: fiscal_doc={fiscal_doc}, user_id={message.from_user.id}")
             return
         item_map = {}
@@ -785,18 +764,10 @@ async def process_fiscal_doc(message: Message, state: FSMContext):
         await state.set_state(ReturnReceipt.SELECT_ITEM)
         logger.info(f"Чек для возврата найден: fiscal_doc={fiscal_doc}, user_id={message.from_user.id}")
     except HttpError as e:
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]],
-            resize_keyboard=True
-        )
-        await message.answer(f"Ошибка получения данных из Google Sheets: {e.status_code} - {e.reason}. Проверьте /debug.", reply_markup=keyboard)
+        await message.answer(f"Ошибка получения данных из Google Sheets: {e.status_code} - {e.reason}. Проверьте /debug.", reply_markup=reset_keyboard())
         logger.error(f"Ошибка /return: {e.status_code} - {e.reason}, user_id={message.from_user.id}")
     except Exception as e:
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]],
-            resize_keyboard=True
-        )
-        await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.", reply_markup=keyboard)
+        await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.", reply_markup=reset_keyboard())
         logger.error(f"Неожиданная ошибка /return: {str(e)}, user_id={message.from_user.id}")
 
 # (Дополнительные обработчики, такие как SELECT_ITEM, можно оставить без изменений, если они уже определены)
@@ -831,21 +802,18 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
     loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
 
     if not message.photo:
-        await loading_message.edit_text("Пожалуйста, отправьте фото QR-кода.", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True))
+        await loading_message.edit_text("Пожалуйста, отправьте фото QR-кода.", reply_markup=reset_keyboard())
         logger.info(f"Фото отсутствует для возврата: user_id={message.from_user.id}")
         return
 
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed_data:
-        await loading_message.edit_text("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True))
+        await loading_message.edit_text("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=reset_keyboard())
         logger.info(f"Ошибка обработки QR-кода для возврата: user_id={message.from_user.id}")
         return
 
     if parsed_data["operation_type"] != 2:
-        await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True))
+        await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=reset_keyboard())
         logger.info(f"Некорректный чек для возврата: operation_type={parsed_data['operation_type']}, user_id={message.from_user.id}")
         return
 
@@ -868,8 +836,7 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
             break
 
     if not found_match:
-        await loading_message.edit_text(f"Товар «{expected_item}» не найден в чеке возврата.", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True))
+        await loading_message.edit_text(f"Товар «{expected_item}» не найден в чеке возврата.", reply_markup=reset_keyboard())
         logger.info(
             "Товар не найден в чеке возврата: need=%s, got_items=%s, user_id=%s",
             expected_item,
@@ -881,8 +848,7 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
 
     new_fiscal_doc = parsed_data["fiscal_doc"]
     if not await is_fiscal_doc_unique(new_fiscal_doc):
-        await loading_message.edit_text(f"Чек с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]], resize_keyboard=True))
+        await loading_message.edit_text(f"Чек с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=reset_keyboard())
         logger.info(f"Дубликат фискального номера: new_fiscal_doc={new_fiscal_doc}, user_id={message.from_user.id}")
         return
 
@@ -1023,41 +989,42 @@ async def get_balance(message: Message):
 @router.message(AddManualAPI.FN)
 async def add_manual_fn(message: Message, state: FSMContext):
     await state.update_data(fn=message.text.strip())
-    await message.answer("Введите *ФД* (номер фискального документа):", parse_mode="Markdown")
     await state.set_state(AddManualAPI.FD)
+    await message.answer("Введите номер ФД:", reply_markup=reset_keyboard())
 
 @router.message(AddManualAPI.FD)
 async def add_manual_fd(message: Message, state: FSMContext):
     await state.update_data(fd=message.text.strip())
-    await message.answer("Введите *ФП/ФПД* (фискальный признак документа):", parse_mode="Markdown")
     await state.set_state(AddManualAPI.FP)
+    await message.answer("Введите ФП (фискальный признак):", reply_markup=reset_keyboard())
 
 @router.message(AddManualAPI.FP)
 async def add_manual_fp(message: Message, state: FSMContext):
     await state.update_data(fp=message.text.strip())
-    await message.answer("Введите *итоговую сумму* (например: 123.45):", parse_mode="Markdown")
     await state.set_state(AddManualAPI.SUM)
+    await message.answer("Введите сумму чека (например: 123.45):", reply_markup=reset_keyboard())
 
 @router.message(AddManualAPI.SUM)
 async def add_manual_sum(message: Message, state: FSMContext):
     try:
         await state.update_data(s=float(message.text.replace(",", ".")))
-        await message.answer("Введите *дату* чека (ММДДГГ, например 210225):", parse_mode="Markdown")
         await state.set_state(AddManualAPI.DATE)
+        await message.answer("Введите дату (в формате ДДММГГ):", reply_markup=reset_keyboard())
     except ValueError:
         await message.answer("Неверный формат суммы. Попробуйте ещё раз.")
 
 @router.message(AddManualAPI.DATE)
 async def add_manual_date(message: Message, state: FSMContext):
     await state.update_data(date=message.text.strip())
-    await message.answer("Введите *время* чека (ЧЧ:ММ):", parse_mode="Markdown")
     await state.set_state(AddManualAPI.TIME)
+    await message.answer("Введите время (в формате ЧЧ:ММ):", reply_markup=reset_keyboard())
+
 
 @router.message(AddManualAPI.TIME)
 async def add_manual_time(message: Message, state: FSMContext):
     await state.update_data(time=message.text.strip())
-    await message.answer("Введите *тип операции* (приход, возврат прихода, расход, возврат расхода):", parse_mode="Markdown")
     await state.set_state(AddManualAPI.TYPE)
+    await message.answer("Введите тип операции (1=приход, 2=возврат прихода, 3=расход, 4=возврат расхода):", reply_markup=reset_keyboard())
 
 @router.message(AddManualAPI.TYPE)
 async def add_manual_type(message: Message, state: FSMContext):
@@ -1104,11 +1071,7 @@ async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext
             return
 
         await loading.edit_text("✅ Чек получен.")
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Сброс")]],
-            resize_keyboard=True
-        )
-        await callback.message.answer("Введите заказчика (или /skip):", reply_markup=keyboard)
+        await callback.message.answer("Введите заказчика (или /skip):", reply_markup=reset_keyboard())
 
         await state.update_data(
             username=callback.from_user.username or str(callback.from_user.id),
