@@ -60,7 +60,7 @@ async def save_receipt(
 ):
     """Сохраняет чек в Google Sheets:
     - Все товары пишутся в 'Чеки'
-    - Все товары параллельно пишутся в 'Сводка'
+    - В 'Сводка' пишутся только покупки/предоплаты, НО не полный чек
     - Исключённые товары пишутся только в 'Сводка' как 'Услуга'
     """
 
@@ -92,7 +92,7 @@ async def save_receipt(
             delivery_date_final = data.get("delivery_date", delivery_date or "")
             type_for_sheet = data.get("receipt_type", receipt_type)
 
-            # Приведение даты
+            # Нормализация даты
             def _normalize_date(s: str) -> str:
                 s = s.replace("-", ".")
                 try:
@@ -134,13 +134,14 @@ async def save_receipt(
                     body={"values": [row]},
                 ).execute()
 
-                # 👇 Дублируем в Сводка
-                await save_receipt_summary(
-                    date=date_for_sheet,
-                    operation_type="Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                    sum_value=-abs(item_sum),
-                    note=f"{fiscal_doc} - {item_name}"
-                )
+                # 👇 В Сводка пишем только если это не "Полный"
+                if type_for_sheet not in ("Полный",):
+                    await save_receipt_summary(
+                        date=date_for_sheet,
+                        operation_type="Покупка" if type_for_sheet == "Покупка" else type_for_sheet,
+                        sum_value=-abs(item_sum),
+                        note=f"{fiscal_doc} - {item_name}"
+                    )
 
             # Исключённые товары — только в Сводка
             if data.get("excluded_sum", 0) > 0:
@@ -155,7 +156,7 @@ async def save_receipt(
                     f"позиции={data.get('excluded_items', [])}, user_name={user_name}"
                 )
 
-            logger.info(f"Чек подтвержден: fiscal_doc={fiscal_doc}, user_name={user_name}")
+            logger.info(f"Чек сохранён: fiscal_doc={fiscal_doc}, user_name={user_name}, type={type_for_sheet}")
             return True
 
         else:
@@ -165,6 +166,7 @@ async def save_receipt(
     except Exception as e:
         logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_name={user_name}")
         return False
+
 
 
 
