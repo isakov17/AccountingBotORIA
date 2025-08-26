@@ -8,12 +8,14 @@ logger = logging.getLogger("AccountingBot")
 load_dotenv()
 
 YOUR_ADMIN_ID = int(os.getenv("YOUR_ADMIN_ID")) if os.getenv("YOUR_ADMIN_ID") else None
+USER_ID_1 = int(os.getenv("USER_ID_1")) if os.getenv("USER_ID_1") else None
+USER_ID_2 = int(os.getenv("USER_ID_2")) if os.getenv("USER_ID_2") else None
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SHEET_NAME = os.getenv("SHEET_NAME")
 PROVERKACHEKA_TOKEN = os.getenv("PROVERKACHEKA_TOKEN")
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEETS_LINK= os.getenv("SPREADSHEETS_LINK")
+SPREADSHEETS_LINK = os.getenv("SPREADSHEETS_LINK")
 
 # Загрузка Google Credentials из файла credentials.json
 try:
@@ -31,7 +33,10 @@ except json.JSONDecodeError:
 for var, name in [
     (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
     (SHEET_NAME, "SHEET_NAME"),
-    (PROVERKACHEKA_TOKEN, "PROVERKACHEKA_TOKEN")
+    (PROVERKACHEKA_TOKEN, "PROVERKACHEKA_TOKEN"),
+    (YOUR_ADMIN_ID, "YOUR_ADMIN_ID"),
+    (USER_ID_1, "USER_ID_1"),
+    (USER_ID_2, "USER_ID_2")
 ]:
     if not var:
         logger.error(f"{name} не задан в .env")

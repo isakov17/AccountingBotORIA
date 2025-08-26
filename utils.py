@@ -1,9 +1,32 @@
-# utils.py — обновлённая функция parse_qr_from_photo
 from exceptions import is_excluded, get_excluded_items
 import logging
 import aiohttp
 from config import PROVERKACHEKA_TOKEN
+import redis.asyncio as redis
+import json
+
 logger = logging.getLogger("AccountingBot")
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+async def cache_get(key):
+    try:
+        data = await redis_client.get(key)
+        if data is not None:
+            return json.loads(data)
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка чтения из Redis: {str(e)}")
+        return None
+
+async def cache_set(key, value, expire=None):
+    try:
+        await redis_client.set(key, json.dumps(value))
+        if expire:
+            await redis_client.expire(key, expire)
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка записи в Redis: {str(e)}")
+        return False
 
 async def parse_qr_from_photo(bot, file_id):
     file = await bot.get_file(file_id)
@@ -21,13 +44,13 @@ async def parse_qr_from_photo(bot, file_id):
                     data_json = result.get("data", {}).get("json", {})
                     if data_json:
                         items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()  # Загружаем исключения один раз
+                        excluded_items = get_excluded_items()
                         filtered_items = []
                         excluded_sum = 0.0
 
                         for item in items:
                             name = item.get("name", "Неизвестно").strip()
-                            price = item.get("sum", 0) / 100  # в рублях
+                            price = item.get("sum", 0) / 100
                             if is_excluded(name):
                                 logger.info(f"Найден исключённый товар: '{name}' (цена: {price})")
                                 excluded_sum += price
@@ -39,7 +62,6 @@ async def parse_qr_from_photo(bot, file_id):
                             })
 
                         total_sum = data_json.get("totalSum", 0) / 100
-                        # Сохраняем исключённую сумму отдельно
                         return {
                             "fiscal_doc": data_json.get("fiscalDocumentNumber", "unknown"),
                             "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
@@ -48,8 +70,8 @@ async def parse_qr_from_photo(bot, file_id):
                             "qr_string": result.get("request", {}).get("qrraw", ""),
                             "operation_type": data_json.get("operationType", 1),
                             "prepaid_sum": data_json.get("prepaidSum", 0) / 100,
-                            "total_sum": total_sum,  # полная сумма чека
-                            "excluded_sum": excluded_sum,  # сумма исключённых позиций
+                            "total_sum": total_sum,
+                            "excluded_sum": excluded_sum,
                             "excluded_items": [item.get("name") for item in items if is_excluded(item.get("name", "").strip())]
                         }
                     else:
@@ -62,53 +84,22 @@ async def parse_qr_from_photo(bot, file_id):
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
 
-import aiohttp
-from datetime import datetime
-
-OP_TYPE_MAPPING = {
-    "приход": 1,
-    "возврат прихода": 2,
-    "расход": 3,
-    "возврат расхода": 4
-}
-
 async def confirm_manual_api(data, user):
     logger.info(f"confirm_manual_api: Входные данные data={data}")
     sum_value = data.get("sum") or data.get("s", 0.0)
     op_type_str = data.get("op_type", "приход")
     op_type_num = OP_TYPE_MAPPING.get(op_type_str.lower(), 1)
+    dt = datetime.strptime(f"{data['date']} {data['time']}", "%d.%m.%Y %H:%M:%S")
+    qr_string = f"t={dt.strftime('%Y%m%dT%H%M%S')}&s={sum_value}&fn={data['fn']}&i={data['fd']}&fp={data['fp']}&n={op_type_num}"
 
-    if not sum_value:
-        logger.error(f"Отсутствует поле sum/s в data: {data}")
-        return False, "❌ Ошибка: отсутствует сумма чека.", None
-    if not op_type_str:
-        logger.error(f"Отсутствует поле op_type в data: {data}")
-        return False, "❌ Ошибка: отсутствует тип операции.", None
-
-    # Формируем дату и время для t
-    try:
-        dt = datetime.strptime(data['date'] + data['time'], "%d%m%y%H:%M")
-        t = dt.strftime("%Y%m%dT%H%M")
-    except ValueError as e:
-        logger.error(f"Некорректный формат даты/времени: {data['date']} {data['time']}, ошибка: {e}")
-        return False, f"❌ Ошибка: некорректный формат даты/времени ({data['date']} {data['time']}).", None
-
-    # Генерируем qr_string
-    qr_string = (
-        f"t={t}&s={str(sum_value).replace('.', ',')}&fn={data['fn']}"
-        f"&i={data['fd']}&fp={data['fp']}&n={op_type_num}"
-    )
-
-    # Формируем payload для API
     payload = {
-        "token": PROVERKACHEKA_TOKEN,
         "fn": data["fn"],
         "fd": data["fd"],
         "fp": data["fp"],
         "t": dt.strftime("%Y-%m-%dT%H:%M:%S"),
         "n": op_type_num,
         "s": float(sum_value),
-        "qr": 0  # если добавляем вручную
+        "qr": 0
     }
 
     try:
@@ -156,7 +147,7 @@ async def confirm_manual_api(data, user):
                     "date": data_json.get("dateTime", dt.strftime("%d.%m.%Y")).split("T")[0].replace("-", "."),
                     "store": data_json.get("retailPlace", "Неизвестно"),
                     "items": filtered_items,
-                    "qr_string": qr_string,  # Всегда используем сгенерированную qr_string
+                    "qr_string": qr_string,
                     "operation_type": op_type_str,
                     "prepaid_sum": data_json.get("prepaidSum", 0) / 100,
                     "total_sum": total_sum,
@@ -183,7 +174,9 @@ async def confirm_manual_api(data, user):
         }
         return False, f"❌ Ошибка при обращении к API: {e}", parsed_data
 
-
-
-
-
+OP_TYPE_MAPPING = {
+    "приход": 1,
+    "возврат прихода": 2,
+    "расход": 3,
+    "возврат расхода": 4
+}
