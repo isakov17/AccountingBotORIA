@@ -5,6 +5,7 @@ from config import SHEET_NAME, GOOGLE_CREDENTIALS
 from datetime import datetime
 from googleapiclient.errors import HttpError
 from utils import cache_get, cache_set  # Импорт утилит Redis
+import time
 
 logger = logging.getLogger("AccountingBot")
 
