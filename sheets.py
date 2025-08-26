@@ -4,7 +4,7 @@ from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 import logging
 from config import SHEET_NAME, GOOGLE_CREDENTIALS, USERS
-from notifications import send_notifications, notified_items
+from handlers.notifications import send_notifications, notified_items
 from datetime import datetime
 from googleapiclient.errors import HttpError
 from utils import redis_client, cache_get, cache_set
