@@ -50,4 +50,3 @@ code.txt
 # Конфиденциальные файлы
 .env
 credentials.json
-deploy.sh
