@@ -1,49 +1,21 @@
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 import logging
-from config import SHEET_NAME, GOOGLE_CREDENTIALS, USERS, sheets_service, USERS
-
+from config import SHEET_NAME, GOOGLE_CREDENTIALS, USERS
+from notifications import send_notifications, notified_items
 from datetime import datetime
 from googleapiclient.errors import HttpError
-from utils import cache_get, cache_set  # Импорт утилит Redis
+from utils import redis_client, cache_get, cache_set
 import time
+
 
 logger = logging.getLogger("AccountingBot")
 
-# Инициализация Google Sheets API
-creds = service_account.Credentials.from_service_account_info(
-    GOOGLE_CREDENTIALS, scopes=['https://www.googleapis.com/auth/spreadsheets']
-)
-sheets_service = build('sheets', 'v4', credentials=creds)
+# Инициализация sheets_service
+sheets_service = build("sheets", "v4", credentials=Credentials.from_authorized_user_info(GOOGLE_CREDENTIALS))
 
-async def is_user_allowed(user_id: int) -> str | None:
-    start_time = time.time()
-    cache_key = f"user_allowed:{user_id}"
-    cached = await cache_get(cache_key)
-    if cached is not None:
-        logger.info(f"Cache hit for user_id={user_id}")
-        return cached
-
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
-        ).execute()
-        rows = result.get("values", [])[1:]  # Пропускаем заголовок
-        for row in rows:
-            if len(row) > 0 and str(row[0]) == str(user_id):
-                user_name = row[1] if len(row) > 1 else f"User_{user_id}"
-                await cache_set(cache_key, user_name, expire=10000)  # Кэш на 1 час
-                return user_name
-        await cache_set(cache_key, None, expire=3600)
-        logger.info(f"is_user_allowed took {time.time() - start_time:.3f}s")
-        logger.info(f"Пользователь не найден в AllowedUsers: user_id={user_id}")
-        return None
-    except HttpError as e:
-        logger.error(f"Google Sheets error: {str(e)}, user_id={user_id}")
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка проверки пользователя: {str(e)}, user_id={user_id}")
-        return None
 
 async def is_fiscal_doc_unique(fiscal_doc: str) -> bool:
     cache_key = f"fiscal_doc:{fiscal_doc}"
@@ -88,8 +60,7 @@ from notifications import send_notifications, notified_items
 from datetime import datetime
 
 logger = logging.getLogger("AccountingBot")
-
-async def is_user_allowed(user_id: int) -> bool:
+async def is_user_allowed(user_id: int) -> str | None:
     start_time = time.time()
     cache_key = f"user_allowed:{user_id}"
     cached = await cache_get(cache_key)
@@ -99,19 +70,24 @@ async def is_user_allowed(user_id: int) -> bool:
 
     try:
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
         ).execute()
-        allowed_users = [int(row[0]) for row in result.get("values", [])[1:] if row[0].isdigit()]
-        is_allowed = user_id in allowed_users
-        await cache_set(cache_key, is_allowed, expire=86400)  # Кэш на 24 часа
-        logger.info(f"User check: user_id={user_id}, allowed={is_allowed}, time={time.time() - start_time:.2f}s")
-        return is_allowed
+        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        for row in rows:
+            if len(row) > 0 and str(row[0]) == str(user_id):
+                user_name = row[1] if len(row) > 1 else f"User_{user_id}"
+                await cache_set(cache_key, user_name, expire=10000)  # Кэш на 1 час
+                return user_name
+        await cache_set(cache_key, None, expire=3600)
+        logger.info(f"is_user_allowed took {time.time() - start_time:.3f}s")
+        logger.info(f"Пользователь не найден в AllowedUsers: user_id={user_id}")
+        return None
     except HttpError as e:
-        logger.error(f"Ошибка проверки пользователя {user_id}: {e.status_code} - {e.reason}")
-        return False
+        logger.error(f"Google Sheets error: {str(e)}, user_id={user_id}")
+        return None
     except Exception as e:
-        logger.error(f"Неожиданная ошибка проверки пользователя {user_id}: {str(e)}")
-        return False
+        logger.error(f"Ошибка проверки пользователя: {str(e)}, user_id={user_id}")
+        return None
 
 async def invalidate_balance_cache():
     """Инвалидирует кэш баланса."""

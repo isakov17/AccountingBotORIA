@@ -7,16 +7,16 @@ logger = logging.getLogger("AccountingBot")
 
 load_dotenv()
 
-YOUR_ADMIN_ID = int(os.getenv("YOUR_ADMIN_ID")) if os.getenv("YOUR_ADMIN_ID") else None
-USER_ID_1 = int(os.getenv("USER_ID_1"))
-USER_ID_2 = int(os.getenv("USER_ID_2"))
-USERS = json.loads(os.getenv("USERS"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SHEET_NAME = os.getenv("SHEET_NAME")
-PROVERKACHEKA_TOKEN = os.getenv("PROVERKACHEKA_TOKEN")
-OCR_API_KEY = os.getenv("OCR_API_KEY")
+TELEGRAM_TOKEN = get_env_var("TELEGRAM_TOKEN")
+SHEET_NAME = get_env_var("SHEET_NAME")
+SPREADSHEETS_LINK = get_env_var("SPREADSHEETS_LINK")
+PROVERKACHEKA_TOKEN = get_env_var("PROVERKACHEKA_TOKEN")
+OCR_API_KEY = get_env_var("OCR_API_KEY")
+YOUR_ADMIN_ID = get_env_var("YOUR_ADMIN_ID", convert_type=int)
+USER_ID_1 = get_env_var("USER_ID_1", convert_type=int)
+USER_ID_2 = get_env_var("USER_ID_2", convert_type=int)
+USERS = get_env_var("USERS", convert_type=json.loads)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEETS_LINK= os.getenv("SPREADSHEETS_LINK")
 
 # Загрузка Google Credentials из файла credentials.json
 try:
@@ -29,13 +29,3 @@ except FileNotFoundError:
 except json.JSONDecodeError:
     logger.error("Некорректный формат credentials.json")
     raise SystemExit("Некорректный формат credentials.json")
-
-# Проверка обязательных переменных
-for var, name in [
-    (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
-    (SHEET_NAME, "SHEET_NAME"),
-    (PROVERKACHEKA_TOKEN, "PROVERKACHEKA_TOKEN")
-]:
-    if not var:
-        logger.error(f"{name} не задан в .env")
-        raise SystemExit(f"{name} не задан в .env")
