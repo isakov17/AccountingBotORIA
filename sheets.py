@@ -157,6 +157,74 @@ async def save_receipt(
         logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}")
         return False
 
+
+async def save_receipt_summary(date, operation_type, sum_value, note):
+    print(f"Сохранение: {sum_value}, note: {note}")
+    try:
+        # Приведение даты
+        def _normalize_date(s: str) -> str:
+            s = s.replace("-", ".")
+            try:
+                if len(s.split(".")) == 3:
+                    if len(s.split(".")[0]) == 4:
+                        return datetime.strptime(s, "%Y.%m.%d").strftime("%d.%m.%Y")
+                    return datetime.strptime(s, "%d.%m.%Y").strftime("%d.%m.%Y")
+            except Exception:
+                pass
+            return datetime.now().strftime("%d.%m.%Y")
+
+        formatted_date = _normalize_date(date)
+
+        # Получаем текущие данные
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_NAME, range="Сводка!A:E"
+        ).execute()
+        rows = result.get("values", [])
+        
+        # Определяем текущий баланс
+        current_balance = 0.0
+        if len(rows) > 1:
+            last_row = rows[-1]
+            if len(last_row) > 4 and last_row[4]:
+                try:
+                    current_balance = float(last_row[4])
+                except ValueError:
+                    pass
+
+        # Для услуг делаем sum_value отрицательным (расход)
+        if operation_type == "Услуга":
+            sum_value = -abs(sum_value)
+
+        # Определяем, куда писать сумму
+        income = sum_value if sum_value > 0 else ""
+        expense = abs(sum_value) if sum_value < 0 else ""
+
+        new_balance = current_balance + sum_value
+
+        summary_row = [
+            formatted_date,
+            operation_type,
+            income,
+            expense,
+            note
+        ]
+
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SHEET_NAME,
+            range="Сводка!A:E",
+            valueInputOption="RAW",
+            body={"values": [summary_row]}
+        ).execute()
+
+        logger.info(f"Запись в Сводка: {summary_row}, баланс: {new_balance:.2f}")
+
+    except HttpError as e:
+        logger.error(f"Ошибка записи в Сводка: {e.status_code} - {e.reason}")
+        raise
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка записи в Сводка: {str(e)}.")
+        raise
+
 def normalize_amount(value: str) -> float:
     if not value:
         return 0.0
