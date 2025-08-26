@@ -950,22 +950,19 @@ async def get_balance(message: Message):
 
     loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
     try:
-        balance_data = await get_monthly_balance()
+        cache_key = "balance_data"
+        balance_data = await cache_get(cache_key)
+        if balance_data is None:
+            balance_data = await get_monthly_balance()
+            await cache_set(cache_key, balance_data, expire=3600)
+            logger.info("Balance data cached")
+
         if balance_data:
             initial_balance = balance_data.get("initial_balance", 0.0)
             spent = abs(balance_data.get("spent", 0.0))
             returned = balance_data.get("returned", 0.0)
             balance = balance_data.get("balance", 0.0)
-
-            # Получаем дату обновления из A1 (опционально)
-            try:
-                date_result = sheets_service.spreadsheets().values().get(
-                    spreadsheetId=SHEET_NAME, range="Сводка!A1"
-                ).execute()
-                update_date = date_result.get("values", [[datetime.now().strftime("%d.%m.%Y")]])[0][0]
-            except Exception:
-                update_date = datetime.now().strftime("%d.%m.%Y")
-                logger.warning("Не удалось получить дату обновления из A1, используется текущая дата")
+            update_date = balance_data.get("update_date", datetime.now().strftime("%d.%m.%Y"))
 
             await loading_message.edit_text(
                 f"💸 Баланс на {update_date}:\n"

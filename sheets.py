@@ -1,7 +1,8 @@
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import logging
-from config import SHEET_NAME, GOOGLE_CREDENTIALS
+from config import SHEET_NAME, GOOGLE_CREDENTIALS, USERS, sheets_service, USERS
+
 from datetime import datetime
 from googleapiclient.errors import HttpError
 from utils import cache_get, cache_set  # Импорт утилит Redis
@@ -78,6 +79,45 @@ import logging
 
 logger = logging.getLogger("AccountingBot")
 
+from googleapiclient.errors import HttpError
+import time
+from config import sheets_service, SHEET_NAME
+from utils import redis_client, cache_get, cache_set
+import logging
+from notifications import send_notifications, notified_items
+from datetime import datetime
+
+logger = logging.getLogger("AccountingBot")
+
+async def is_user_allowed(user_id: int) -> bool:
+    start_time = time.time()
+    cache_key = f"user_allowed:{user_id}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit for user_id={user_id}")
+        return cached
+
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+        ).execute()
+        allowed_users = [int(row[0]) for row in result.get("values", [])[1:] if row[0].isdigit()]
+        is_allowed = user_id in allowed_users
+        await cache_set(cache_key, is_allowed, expire=86400)  # Кэш на 24 часа
+        logger.info(f"User check: user_id={user_id}, allowed={is_allowed}, time={time.time() - start_time:.2f}s")
+        return is_allowed
+    except HttpError as e:
+        logger.error(f"Ошибка проверки пользователя {user_id}: {e.status_code} - {e.reason}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка проверки пользователя {user_id}: {str(e)}")
+        return False
+
+async def invalidate_balance_cache():
+    """Инвалидирует кэш баланса."""
+    await redis_client.delete("balance_data")
+    logger.info("Кэш баланса инвалидирован: balance_data")
+
 async def save_receipt(
     data_or_parsed=None,
     user_name: str = "",
@@ -87,110 +127,66 @@ async def save_receipt(
     operation_type: int | None = None,
     **kwargs
 ):
-    if data_or_parsed is None:
-        if "parsed_data" in kwargs:
-            data_or_parsed = kwargs["parsed_data"]
-        elif "receipt" in kwargs:
-            data_or_parsed = kwargs["receipt"]
-
+    """Сохраняет чек в Google Sheets и отправляет уведомления."""
     try:
-        is_receipt_like = isinstance(data_or_parsed, dict) and (
-            "status" in data_or_parsed
-            or "receipt_type" in data_or_parsed
-            or "customer" in data_or_parsed
-        )
-        data = data_or_parsed or {}
+        # Получаем текущую длину таблицы для определения row_index
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_NAME, range="Чеки!A:A"
+        ).execute()
+        row_index = len(result.get("values", []))  # Индекс новой строки (1-based)
 
-        if is_receipt_like:
-            if not data.get("items") and data.get("excluded_sum", 0) <= 0:
-                logger.error(f"save_receipt: нет товаров и нет исключённой суммы, user_name={user_name}")
-                return False
+        # Извлекаем данные чека
+        fiscal_doc = data_or_parsed.get("fiscal_doc", "") if data_or_parsed else ""
+        amount = data_or_parsed.get("amount", "") if data_or_parsed else ""
+        purchase_date = data_or_parsed.get("date", "") if data_or_parsed else datetime.now().strftime("%d.%m.%Y")
+        qr_string = data_or_parsed.get("qr_string", "") if data_or_parsed else ""
+        item_name = data_or_parsed.get("item_name", "") if data_or_parsed else ""
+        shop = data_or_parsed.get("shop", "") if data_or_parsed else ""
+        status = "Ожидает" if delivery_date else "Доставлено"
 
-            fiscal_doc = data.get("fiscal_doc", "")
-            store = data.get("store", "Неизвестно")
-            raw_date = data.get("date") or datetime.now().strftime("%Y.%m.%d")
-            qr_string = data.get("qr_string", "")
-            status = data.get("status", "Доставлено" if receipt_type in ("Покупка", "Полный") else "Ожидает")
-            customer = data.get("customer", customer or "Неизвестно")
-            delivery_date_final = data.get("delivery_date", delivery_date or "")
-            type_for_sheet = data.get("receipt_type", receipt_type)
+        # Формируем строку для добавления
+        row_data = [
+            datetime.now().strftime("%d.%m.%Y"),  # Дата добавления
+            purchase_date,                        # Дата покупки
+            str(amount),                          # Сумма
+            user_name,                            # Имя пользователя
+            shop,                                 # Магазин
+            delivery_date or "",                  # Дата доставки
+            status,                               # Статус
+            customer or "",                       # Заказчик
+            item_name,                            # Товар
+            receipt_type,                         # Тип чека
+            fiscal_doc,                           # Фискальный номер
+            qr_string,                            # QR-строка
+            ""                                    # QR-строка возврата
+        ]
 
-            def _normalize_date(s: str) -> str:
-                s = s.replace("-", ".")
-                try:
-                    if len(s.split(".")) == 3:
-                        if len(s.split(".")[0]) == 4:
-                            return datetime.strptime(s, "%Y.%m.%d").strftime("%d.%m.%Y")
-                        return datetime.strptime(s, "%d.%m.%Y").strftime("%d.%m.%Y")
-                except Exception:
-                    pass
-                return datetime.now().strftime("%d.%m.%Y")
+        # Добавляем чек в Google Sheets
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SHEET_NAME,
+            range="Чеки!A:M",
+            valueInputOption="RAW",
+            body={"values": [row_data]}
+        ).execute()
+        logger.info(f"Чек сохранён: fiscal_doc={fiscal_doc}, user_name={user_name}, row_index={row_index}")
 
-            date_for_sheet = _normalize_date(raw_date)
-            added_at = datetime.now().strftime("%d.%m.%Y")
+        # Инвалидация кэша баланса для всех чеков
+        await invalidate_balance_cache()
+        # Инвалидация кэша уведомлений и отправка уведомлений для чеков "Ожидает"
+        notification_key = f"{fiscal_doc}_{row_index}"
+        if status == "Ожидает" and notification_key not in notified_items:
+            await redis_client.delete("notifications:pending_checks")
+            logger.info(f"Кэш уведомлений инвалидирован: notification_key={notification_key}")
+            # Отправляем уведомления в будний день
+            if datetime.now().weekday() < 5:
+                await send_notifications(kwargs.get("bot"))
 
-            # Сохраняем обычные товары
-            for item in data.get("items", []):
-                item_name = item["name"]
-                item_sum = float(item.get("sum", 0))
-                row = [
-                    added_at,
-                    date_for_sheet,
-                    item_sum,
-                    user_name,
-                    store,
-                    delivery_date_final or "",
-                    status,
-                    customer,
-                    item_name,
-                    type_for_sheet,
-                    str(fiscal_doc),
-                    qr_string,
-                    ""
-                ]
-                sheets_service.spreadsheets().values().append(
-                    spreadsheetId=SHEET_NAME,
-                    range="Чеки!A:M",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": [row]},
-                ).execute()
-
-                # Инвалидация кэша для fiscal_doc
-                if fiscal_doc:
-                    await redis_client.delete(f"fiscal_doc:{fiscal_doc}")
-                    logger.info(f"Кэш инвалидирован для fiscal_doc={fiscal_doc}")
-
-                if type_for_sheet not in ("Полный",):
-                    await save_receipt_summary(
-                        date=date_for_sheet,
-                        operation_type="Покупка" if type_for_sheet == "Покупка" else type_for_sheet,
-                        sum_value=-abs(item_sum),
-                        note=f"{fiscal_doc} - {item_name}"
-                    )
-
-            # Исключённые товары
-            if data.get("excluded_sum", 0) > 0:
-                await save_receipt_summary(
-                    date=date_for_sheet,
-                    operation_type="Услуга",
-                    sum_value=-abs(data["excluded_sum"]),
-                    note=f"{fiscal_doc} - Исключённые позиции: {', '.join(data.get('excluded_items', []))}"
-                )
-                logger.info(
-                    f"Исключённые товары записаны в Сводка: сумма={data['excluded_sum']}, "
-                    f"позиции={data.get('excluded_items', [])}, user_name={user_name}"
-                )
-
-            logger.info(f"Чек сохранён: fiscal_doc={fiscal_doc}, user_name={user_name}, type={type_for_sheet}")
-            return True
-
-        else:
-            logger.error(f"save_receipt: неподдерживаемый формат данных, user_name={user_name}")
-            return False
-
+        return True
+    except HttpError as e:
+        logger.error(f"Ошибка сохранения чека: {e.status_code} - {e.reason}")
+        return False
     except Exception as e:
-        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_name={user_name}")
+        logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}")
         return False
 
 
@@ -278,42 +274,29 @@ def normalize_amount(value: str) -> float:
 
 
 async def get_monthly_balance():
-    """
-    Получает начальный баланс из C2, остаток из I1, потрачено из L1, возвраты из O1.
-    """
+    """Получает баланс и дату обновления из Сводка!A1:O2."""
     try:
-        # Получаем данные из диапазона Сводка!C1:O2
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Сводка!C1:O2"
+            spreadsheetId=SHEET_NAME, range="Сводка!A1:O2"
         ).execute()
         values = result.get("values", [])
 
-        # Начальный баланс (C2)
-        initial_balance_value = values[1][0] if len(values) > 1 and len(values[1]) > 0 else "0"
-        initial_balance = normalize_amount(initial_balance_value)
-
-        # Остаток (I1, индекс 6)
-        balance_value = values[0][6] if len(values) > 0 and len(values[0]) > 6 else "0"
-        balance = normalize_amount(balance_value)
-
-        # Потрачено (L1, индекс 9)
-        spent_value = values[0][9] if len(values) > 0 and len(values[0]) > 9 else "0"
-        spent = normalize_amount(spent_value)
-
-        # Возвраты (O1, индекс 12)
-        returned_value = values[0][12] if len(values) > 0 and len(values[0]) > 12 else "0"
-        returned = normalize_amount(returned_value)
+        update_date = values[0][0] if values and len(values[0]) > 0 else datetime.now().strftime("%d.%m.%Y")
+        initial_balance_value = values[1][2] if len(values) > 1 and len(values[1]) > 2 else "0"  # C2
+        balance_value = values[0][8] if len(values) > 0 and len(values[0]) > 8 else "0"  # I1
+        spent_value = values[0][11] if len(values) > 0 and len(values[0]) > 11 else "0"  # L1
+        returned_value = values[0][14] if len(values) > 0 and len(values[0]) > 14 else "0"  # O1
 
         return {
-            "spent": round(spent, 2),
-            "returned": round(returned, 2),
-            "balance": round(balance, 2),
-            "initial_balance": round(initial_balance, 2),
+            "spent": round(normalize_amount(spent_value), 2),
+            "returned": round(normalize_amount(returned_value), 2),
+            "balance": round(normalize_amount(balance_value), 2),
+            "initial_balance": round(normalize_amount(initial_balance_value), 2),
+            "update_date": update_date
         }
-
     except HttpError as e:
         logger.error(f"Ошибка получения баланса: {e.status_code} - {e.reason}")
-        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0, "update_date": datetime.now().strftime("%d.%m.%Y")}
     except Exception as e:
         logger.error(f"Ошибка получения баланса: {str(e)}")
-        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
+        return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0, "update_date": datetime.now().strftime("%d.%m.%Y")}
