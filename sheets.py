@@ -2,8 +2,9 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import logging
 from config import SHEET_NAME, GOOGLE_CREDENTIALS
-from datetime import datetime  # Импорт datetime
+from datetime import datetime
 from googleapiclient.errors import HttpError
+from utils import cache_get, cache_set  # Импорт утилит Redis
 
 logger = logging.getLogger("AccountingBot")
 
@@ -14,6 +15,13 @@ creds = service_account.Credentials.from_service_account_info(
 sheets_service = build('sheets', 'v4', credentials=creds)
 
 async def is_user_allowed(user_id: int) -> str | None:
+    start_time = time.time()
+    cache_key = f"user_allowed:{user_id}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit for user_id={user_id}")
+        return cached
+
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
@@ -21,22 +29,42 @@ async def is_user_allowed(user_id: int) -> str | None:
         rows = result.get("values", [])[1:]  # Пропускаем заголовок
         for row in rows:
             if len(row) > 0 and str(row[0]) == str(user_id):
-                return row[1] if len(row) > 1 else f"User_{user_id}"  # Имя или заглушка
+                user_name = row[1] if len(row) > 1 else f"User_{user_id}"
+                await cache_set(cache_key, user_name, expire=10000)  # Кэш на 1 час
+                return user_name
+        await cache_set(cache_key, None, expire=3600)
+        logger.info(f"is_user_allowed took {time.time() - start_time:.3f}s")
         logger.info(f"Пользователь не найден в AllowedUsers: user_id={user_id}")
+        return None
+    except HttpError as e:
+        logger.error(f"Google Sheets error: {str(e)}, user_id={user_id}")
         return None
     except Exception as e:
         logger.error(f"Ошибка проверки пользователя: {str(e)}, user_id={user_id}")
         return None
 
-async def is_fiscal_doc_unique(fiscal_doc):
+async def is_fiscal_doc_unique(fiscal_doc: str) -> bool:
+    cache_key = f"fiscal_doc:{fiscal_doc}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit for fiscal_doc={fiscal_doc}")
+        return cached
+
     try:
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Чеки!K:K"  # Диапазон столбца с fiscal_doc
+            spreadsheetId=SHEET_NAME, range="Чеки!K:K"
         ).execute()
-        fiscal_docs = [str(row[0]).strip() for row in result.get("values", []) if row]  # Преобразуем в строки и убираем пробелы
+        fiscal_docs = [str(row[0]).strip() for row in result.get("values", []) if row]
         is_unique = str(fiscal_doc).strip() not in fiscal_docs
-        logger.info(f"Проверка уникальности fiscal_doc {fiscal_doc}: {'уникален' if is_unique else 'уже существует'} (найдено {len(fiscal_docs)} записей, список: {fiscal_docs})")
+        await cache_set(cache_key, is_unique, expire=86400)  # Кэш на 24 часа
+        logger.info(
+            f"Проверка уникальности fiscal_doc {fiscal_doc}: {'уникален' if is_unique else 'уже существует'} "
+            f"(найдено {len(fiscal_docs)} записей)"
+        )
         return is_unique
+    except HttpError as e:
+        logger.error(f"Google Sheets error: {str(e)}, fiscal_doc={fiscal_doc}")
+        return False
     except Exception as e:
         logger.error(f"Ошибка проверки уникальности fiscal_doc {fiscal_doc}: {str(e)}")
         return False
@@ -58,12 +86,6 @@ async def save_receipt(
     operation_type: int | None = None,
     **kwargs
 ):
-    """Сохраняет чек в Google Sheets:
-    - Все товары пишутся в 'Чеки'
-    - В 'Сводка' пишутся только покупки/предоплаты, НО не полный чек
-    - Исключённые товары пишутся только в 'Сводка' как 'Услуга'
-    """
-
     if data_or_parsed is None:
         if "parsed_data" in kwargs:
             data_or_parsed = kwargs["parsed_data"]
@@ -92,7 +114,6 @@ async def save_receipt(
             delivery_date_final = data.get("delivery_date", delivery_date or "")
             type_for_sheet = data.get("receipt_type", receipt_type)
 
-            # Нормализация даты
             def _normalize_date(s: str) -> str:
                 s = s.replace("-", ".")
                 try:
@@ -134,7 +155,11 @@ async def save_receipt(
                     body={"values": [row]},
                 ).execute()
 
-                # 👇 В Сводка пишем только если это не "Полный"
+                # Инвалидация кэша для fiscal_doc
+                if fiscal_doc:
+                    await redis_client.delete(f"fiscal_doc:{fiscal_doc}")
+                    logger.info(f"Кэш инвалидирован для fiscal_doc={fiscal_doc}")
+
                 if type_for_sheet not in ("Полный",):
                     await save_receipt_summary(
                         date=date_for_sheet,
@@ -143,7 +168,7 @@ async def save_receipt(
                         note=f"{fiscal_doc} - {item_name}"
                     )
 
-            # Исключённые товары — только в Сводка
+            # Исключённые товары
             if data.get("excluded_sum", 0) > 0:
                 await save_receipt_summary(
                     date=date_for_sheet,
@@ -166,8 +191,6 @@ async def save_receipt(
     except Exception as e:
         logger.error(f"Неожиданная ошибка сохранения чека: {str(e)}, user_name={user_name}")
         return False
-
-
 
 
 

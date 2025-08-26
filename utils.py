@@ -5,6 +5,30 @@ import aiohttp
 from config import PROVERKACHEKA_TOKEN
 logger = logging.getLogger("AccountingBot")
 
+import redis.asyncio as redis
+import json
+import logging
+
+logger = logging.getLogger("AccountingBot")
+
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+async def cache_get(key: str):
+    try:
+        value = await redis_client.get(key)
+        return json.loads(value) if value else None
+    except Exception as e:
+        logger.error(f"Redis get error: {str(e)}")
+        return None
+
+async def cache_set(key: str, value, expire: int = 3600):
+    try:
+        await redis_client.set(key, json.dumps(value), ex=expire)
+        return True
+    except Exception as e:
+        logger.error(f"Redis set error: {str(e)}")
+        return False
+
 async def parse_qr_from_photo(bot, file_id):
     file = await bot.get_file(file_id)
     file_path = file.file_path

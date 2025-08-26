@@ -12,6 +12,8 @@ from exceptions import (
 from googleapiclient.errors import HttpError
 import logging
 import aiohttp
+from utils import redis_client  # Импорт redis_client
+
 
 logger = logging.getLogger("AccountingBot")
 router = Router()
@@ -125,8 +127,9 @@ async def debug_sheets(message: Message):
         await message.answer(f"Неожиданная ошибка: {str(e)}")
         logger.error(f"Неожиданная ошибка /debug: {str(e)}, user_id={message.from_user.id}")
 
+
 @router.message(Command("add_user"))
-async def add_user(message: Message):
+async def add_user(message: types.Message):
     if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
         await message.answer("🚫 Доступ запрещен. Только администратор может добавлять пользователей.")
         logger.info(f"Доступ запрещен для /add_user: user_id={message.from_user.id}")
@@ -159,6 +162,9 @@ async def add_user(message: Message):
             valueInputOption="RAW",
             body={"values": [[user_id_str]]}
         ).execute()
+        # Инвалидация кэша
+        await redis_client.delete(f"user_allowed:{user_id}")
+        logger.info(f"Кэш инвалидирован для user_id={user_id}")
         await message.answer(f"✅ Пользователь {user_id} добавлен.")
         logger.info(f"Пользователь добавлен: {user_id}, user_id={message.from_user.id}")
     except HttpError as e:
@@ -169,7 +175,7 @@ async def add_user(message: Message):
         logger.error(f"Неожиданная ошибка /add_user: {str(e)}, user_id={message.from_user.id}")
 
 @router.message(Command("remove_user"))
-async def remove_user(message: Message):
+async def remove_user(message: types.Message):
     if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
         await message.answer("🚫 Доступ запрещен. Только администратор может удалять пользователей.")
         logger.info(f"Доступ запрещен для /remove_user: user_id={message.from_user.id}")
@@ -199,7 +205,7 @@ async def remove_user(message: Message):
             return
 
         # Проверяем, есть ли заголовок
-        header = rows[0] if rows else ["User ID"]  # предполагаем заголовок
+        header = rows[0] if rows else ["User ID"]
         data_rows = rows[1:]
 
         # Фильтруем: оставляем только тех, кто не совпадает с user_id
@@ -210,16 +216,14 @@ async def remove_user(message: Message):
             logger.info(f"Пользователь не найден: {user_id}, user_id={message.from_user.id}")
             return
 
-        # Очищаем весь диапазон A:A, чтобы гарантировать удаление "хвостов"
+        # Очищаем весь диапазон A:A
         sheets_service.spreadsheets().values().clear(
             spreadsheetId=SHEET_NAME,
             range="AllowedUsers!A:A"
         ).execute()
 
-        # Подготавливаем новые данные: заголовок + отфильтрованные строки
-        new_values = [header] + filtered_rows
-
         # Записываем обратно
+        new_values = [header] + filtered_rows
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SHEET_NAME,
             range="AllowedUsers!A1",
@@ -227,6 +231,9 @@ async def remove_user(message: Message):
             body={"values": new_values}
         ).execute()
 
+        # Инвалидация кэша
+        await redis_client.delete(f"user_allowed:{user_id}")
+        logger.info(f"Кэш инвалидирован для user_id={user_id}")
         await message.answer(f"✅ Пользователь {user_id} удален из таблицы.")
         logger.info(f"Пользователь удален: {user_id}, user_id={message.from_user.id}")
 
