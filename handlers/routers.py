@@ -23,7 +23,8 @@ class AddReceiptQR(StatesGroup):
     UPLOAD_QR = State()
     CUSTOMER = State()
     SELECT_TYPE = State()
-    CONFIRM_DELIVERY_DATE = State()
+    CONFIRM_DELIVERY_DATE = State()  # ввод даты для текущего товара
+    WAIT_LINK = State()              # ввод ссылки для текущего товара
     CONFIRM_ACTION = State()
 
 class ConfirmDelivery(StatesGroup):
@@ -253,60 +254,128 @@ async def process_receipt_type(callback, state: FSMContext):
 async def process_delivery_date(message: Message, state: FSMContext):
     data = await state.get_data()
     parsed_data = data["parsed_data"]
-    receipt_type = data["receipt_type"]
     items = parsed_data["items"]
+    receipt_type = data["receipt_type"]
+
+    # индекс текущего товара (по умолчанию 0 — первый)
     current_item_index = data.get("current_item_index", 0)
     delivery_dates = data.get("delivery_dates", [])
+    links = data.get("links", [])
 
+    # --- валидация даты/скипа ---
     if message.text == "/skip":
         delivery_date = ""
     else:
-        date_pattern = r"^\d{6}$"  # Проверяем, что введено ровно 6 цифр
-        if not re.match(date_pattern, message.text):
-            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=reset_keyboard())
+        date_pattern = r"^\d{6}$"
+        if not re.match(date_pattern, message.text or ""):
+            await message.answer(
+                "Неверный формат даты. Используйте ддммгг (например 110825) или /skip.",
+                reply_markup=reset_keyboard()
+            )
             return
         try:
-            day = message.text[0:2]
-            month = message.text[2:4]
-            year = message.text[4:6]
-            # Предполагаем, что текущий год - 2025, берем последние две цифры
-            full_year = f"20{year}"  # Формируем полный год (например, 2025)
+            day, month, year = message.text[:2], message.text[2:4], message.text[4:6]
+            full_year = f"20{year}"
             normalized_date = f"{day}.{month}.{full_year}"
             datetime.strptime(normalized_date, "%d.%m.%Y")
             delivery_date = normalized_date
         except ValueError:
-            await message.answer("Неверный формат даты. Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.", reply_markup=reset_keyboard())
+            await message.answer(
+                "Неверный формат даты. Используйте ддммгг (например 110825) или /skip.",
+                reply_markup=reset_keyboard()
+            )
             return
 
-    delivery_dates.append(delivery_date)
+    # гарантируем длину списка дат до текущего индекса
+    while len(delivery_dates) < current_item_index:
+        delivery_dates.append("")
+    if len(delivery_dates) == current_item_index:
+        delivery_dates.append(delivery_date)
+    else:
+        delivery_dates[current_item_index] = delivery_date
+
+    # сохраняем и переходим за ссылкой для ЭТОГО же товара
     await state.update_data(delivery_dates=delivery_dates)
 
-    if current_item_index + 1 < len(items):
-        await state.update_data(current_item_index=current_item_index + 1)
-        await message.answer(f"Введите дату доставки для {items[current_item_index + 1]['name']} (ддммгг, например 110825 для 11.08.2025) или /skip:", reply_markup=reset_keyboard())
+    item_name = items[current_item_index]['name']
+    await message.answer(
+        f"📎 Пришлите ссылку на «{item_name}» (например: https://www.ozon.ru/...).",
+        reply_markup=reset_keyboard()
+    )
+    await state.set_state(AddReceiptQR.WAIT_LINK)
+
+
+
+@router.message(AddReceiptQR.WAIT_LINK)
+async def process_receipt_link(message: Message, state: FSMContext):
+    link = (message.text or "").strip()
+
+    # Требуем корректный http/https (ссылку нельзя пропустить)
+    if not (link.startswith("http://") or link.startswith("https://")):
+        await message.answer("⚠️ Пожалуйста, отправьте корректную ссылку (http/https).", reply_markup=reset_keyboard())
         return
 
+    data = await state.get_data()
+    parsed_data = data["parsed_data"]
+    items = parsed_data["items"]
+    receipt_type = data["receipt_type"]
+
+    current_item_index = data.get("current_item_index", 0)
+    delivery_dates = data.get("delivery_dates", [])
+    links = data.get("links", [])
+
+    # гарантируем длину списка ссылок до текущего индекса
+    while len(links) < current_item_index:
+        links.append("")
+    if len(links) == current_item_index:
+        links.append(link)
+    else:
+        links[current_item_index] = link
+
+    await state.update_data(links=links)
+
+    # если есть следующий товар — спрашиваем его дату
+    if current_item_index + 1 < len(items):
+        next_index = current_item_index + 1
+        await state.update_data(current_item_index=next_index)
+        await message.answer(
+            f"Введите дату доставки для {items[next_index]['name']} "
+            f"(ддммгг, например 110825) или /skip:",
+            reply_markup=reset_keyboard()
+        )
+        await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
+        return
+
+    # иначе — все товары пройдены, формируем подтверждение
     total_sum = sum(item["sum"] for item in items)
-    items_list = "\n".join([f"- {item['name']} (Сумма: {item['sum']:.2f} RUB, Дата доставки: {delivery_dates[i] or 'Не указана'})" for i, item in enumerate(items)])
+    rows = []
+    for i, item in enumerate(items):
+        d = delivery_dates[i] if i < len(delivery_dates) else ""
+        l = links[i] if i < len(links) else ""
+        rows.append(f"- {item['name']} (Сумма: {item['sum']:.2f} RUB, Доставка: {d or '—'}, Ссылка: {l or '—'})")
+
     receipt = {
         "date": parsed_data["date"],
         "store": parsed_data.get("store", "Неизвестно"),
-        "items": [{"name": item["name"], "sum": item["sum"]} for item in parsed_data["items"]],
+        "items": [{"name": item["name"], "sum": item["sum"]} for item in items],
         "receipt_type": receipt_type,
         "fiscal_doc": parsed_data["fiscal_doc"],
         "qr_string": parsed_data["qr_string"],
         "delivery_dates": delivery_dates,
+        "links": links,  # 👈 массив ссылок по позициям
         "status": "Ожидает",
         "customer": data["customer"]
     }
+
     details = (
         f"Детали чека:\n"
         f"Магазин: {receipt['store']}\n"
         f"Заказчик: {receipt['customer']}\n"
         f"Сумма: {total_sum:.2f} RUB\n"
-        f"Товары:\n{items_list}\n"
+        f"Товары:\n" + "\n".join(rows) + "\n"
         f"Фискальный номер: {parsed_data['fiscal_doc']}"
     )
+
     inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
         [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
@@ -316,21 +385,26 @@ async def process_delivery_date(message: Message, state: FSMContext):
     await state.update_data(receipt=receipt)
     await state.set_state(AddReceiptQR.CONFIRM_ACTION)
 
+
+
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "confirm_add")
 async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     loading_message = await callback.message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
+
     data = await state.get_data()
     receipt = data["receipt"]
     parsed_data = data["parsed_data"]
     user_name = await is_user_allowed(callback.from_user.id)
+
     if not user_name:
         await loading_message.edit_text("🚫 Доступ запрещен.")
         logger.info(f"Доступ запрещен для confirm_add: user_id={callback.from_user.id}")
         await state.clear()
         await callback.answer()
         return
-    delivery_dates = receipt.get("delivery_dates", [])
 
+    delivery_dates = receipt.get("delivery_dates", [])
+    links = receipt.get("links", [])
     is_delivery = receipt.get("receipt_type") == "Предоплата"
     receipt_type_for_save = "Доставка" if is_delivery else "Покупка"
 
@@ -347,7 +421,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
             "status": "Ожидает" if is_delivery else "Доставлено",
             "customer": receipt.get("customer", data.get("customer", "Неизвестно")),
             "excluded_sum": parsed_data.get("excluded_sum", 0.0),
-            "excluded_items": parsed_data.get("excluded_items", [])
+            "excluded_items": parsed_data.get("excluded_items", []),
+            "link": links[i] if i < len(links) else ""   # 👈 ссылка на товар в столбец N
         }
 
         saved = await save_receipt(one, user_name, callback.from_user.id, receipt_type=receipt_type_for_save)
@@ -360,20 +435,17 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     balance_data = await get_monthly_balance()
     balance = balance_data.get("balance", 0.0) if balance_data else 0.0
 
-    # Редактируем сообщение загрузки на результат
     if ok and not fail:
         await loading_message.edit_text(
             f"✅ Чек {receipt['fiscal_doc']} добавлен (пользователь: {user_name}).\n"
             f"Позиции: {ok}/{ok}.\n"
-            f"🟰 Текущий остаток: {balance:.2f} RUB",
-            parse_mode="Markdown"
+            f"🟰 Текущий остаток: {balance:.2f} RUB"
         )
     elif ok and fail:
         await loading_message.edit_text(
             f"⚠️ Чек {receipt['fiscal_doc']} добавлен частично (пользователь: {user_name}).\n"
-            f"Удалось: {ok}, ошибок: {fail}. Смотри /debug для деталей.\n"
-            f"🟰 Текущий остаток: {balance:.2f} RUB",
-            parse_mode="Markdown"
+            f"Удалось: {ok}, ошибок: {fail}.\n"
+            f"🟰 Текущий остаток: {balance:.2f} RUB"
         )
     else:
         await loading_message.edit_text(
@@ -381,10 +453,12 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         )
 
     logger.info(
-        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
+        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, "
+        f"balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
     )
     await state.clear()
     await callback.answer()
+
 
 
 

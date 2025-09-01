@@ -142,11 +142,12 @@ async def save_receipt(
                     type_for_sheet,
                     str(fiscal_doc),
                     qr_string,
-                    ""
+                    "",
+                    data.get("link", "")
                 ]
                 sheets_service.spreadsheets().values().append(
                     spreadsheetId=SHEET_NAME,
-                    range="Чеки!A:M",
+                    range="Чеки!A:N",
                     valueInputOption="RAW",
                     insertDataOption="INSERT_ROWS",
                     body={"values": [row]},

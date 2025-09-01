@@ -36,6 +36,7 @@ async def get_allowed_users() -> dict:
         return {}
 
 async def send_notifications(bot: Bot):
+    logger.info("Начало выполнения send_notifications")
     today = datetime.now()
     if today.weekday() >= 5:  # Суббота или воскресенье
         logger.info("Уведомления не отправляются в выходные")
@@ -45,18 +46,30 @@ async def send_notifications(bot: Bot):
         cache_key = "notifications:pending_checks"
         cached_checks = await cache_get(cache_key)
         if cached_checks is not None:
-            logger.info("Cache hit for pending checks")
+            logger.info(f"Cache hit for pending checks: {len(cached_checks)} чеков")
             checks = cached_checks
         else:
             result = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SHEET_NAME, range="Чеки!A:M"
+                spreadsheetId=SHEET_NAME, range="Чеки!A:N"
             ).execute()
-            checks = [
-                row + [str(index)] for index, row in enumerate(result.get("values", [])[1:], start=2)
-                if len(row) > 6 and row[6].lower() == "ожидает" and len(row) > 5 and row[5]
-            ]
+            raw_checks = result.get("values", [])[1:]  # Пропускаем заголовок
+            logger.info(f"Загружено {len(raw_checks)} строк из Google Sheets")
+            
+            checks = []
+            for index, row in enumerate(raw_checks, start=2):
+                # Проверяем длину строки и нормализуем данные
+                if len(row) < 7:
+                    logger.warning(f"Недостаточно столбцов в строке {index}: {row}")
+                    continue
+                status = row[6].strip().lower() if row[6] else ""
+                delivery_date = row[5].strip() if len(row) > 5 and row[5] else ""
+                if status == "ожидает" and delivery_date:
+                    checks.append(row + [str(index)])
+                else:
+                    logger.info(f"Пропущена строка {index}: status={status}, delivery_date={delivery_date}")
+
             await cache_set(cache_key, checks, expire=10800)  # Кэш на 3 часа
-            logger.info("Pending checks cached")
+            logger.info(f"Pending checks cached: {len(checks)} чеков")
 
         if not checks:
             logger.info("Нет чеков для уведомлений")
@@ -64,32 +77,37 @@ async def send_notifications(bot: Bot):
 
         today_date = today.strftime("%d.%m.%Y")
         three_days_ago = (today - timedelta(days=3)).strftime("%d.%m.%Y")
+        logger.info(f"Проверка уведомлений: today_date={today_date}, three_days_ago={three_days_ago}")
         allowed_users = await get_allowed_users()
         if not allowed_users:
             logger.warning("Список разрешённых пользователей пуст")
             return
 
         for row in checks:
-            delivery_date = row[5]  # Столбец F
-            fiscal_doc = row[10] if len(row) > 10 else ""  # Столбец K
-            item_name = row[8] if len(row) > 8 else ""  # Столбец I
-            user_name = row[3] if len(row) > 3 else ""  # Столбец D
+            delivery_date = row[5].strip() if len(row) > 5 else ""  # Столбец F
+            fiscal_doc = row[10].strip() if len(row) > 10 else ""  # Столбец K
+            item_name = row[8].strip() if len(row) > 8 else ""  # Столбец I
+            user_name = row[3].strip() if len(row) > 3 else ""  # Столбец D
+            link = row[13].strip() if len(row) > 13 else ""  # Столбец N
             notification_key = f"{fiscal_doc}_{row[-1]}"  # Индекс строки
+
+            logger.info(f"Обработка чека: fiscal_doc={fiscal_doc}, delivery_date={delivery_date}, notification_key={notification_key}")
 
             if delivery_date in [today_date, three_days_ago] and notification_key not in notified_items:
                 recipients = {YOUR_ADMIN_ID, USER_ID_1, USER_ID_2}
-                check_user_id = next((uid for uid, name in allowed_users.items() if name == user_name), None)
+                check_user_id = next((uid for uid, name in allowed_users.items() if name.strip() == user_name), None)
                 if check_user_id and check_user_id in allowed_users:
                     recipients.add(check_user_id)
                 else:
                     logger.warning(f"Пользователь {user_name} не найден в AllowedUsers")
 
+                logger.info(f"Получатели уведомления: {recipients}")
                 for user_id in recipients:
                     try:
                         await bot.send_message(
                             user_id,
                             f"Напоминание: товар {item_name} из чека {fiscal_doc} ожидает доставку {delivery_date}. "
-                            f"Отключить: /disable_notifications {notification_key}. "
+                            f"Ссылка: {link}\n"
                             f"Подтвердить доставку: /expenses"
                         )
                         logger.info(f"Уведомление отправлено: fiscal_doc={fiscal_doc}, item={item_name}, user_id={user_id}")
@@ -107,9 +125,9 @@ async def send_notifications(bot: Bot):
 def start_notifications(bot: Bot):
     scheduler.add_job(
         send_notifications,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour="*", minute="*", timezone="Europe/Moscow"),
         args=[bot],
         max_instances=1
     )
     scheduler.start()
-    logger.info("Уведомления запущены: будние дни, 15:00 МСК")
+    logger.info("Уведомления запущены: каждую минуту в будние дни для теста")

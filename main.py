@@ -1,11 +1,11 @@
 from aiogram import Bot, Dispatcher
 from handlers.commands import router as commands_router
 from handlers.routers import router as routers
-from handlers.notifications import send_notifications
+from handlers.notifications import start_notifications
 import asyncio
 from config import TELEGRAM_TOKEN
-from googleapiclient.errors import HttpError
 import logging
+
 
 # Инициализация
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -19,7 +19,7 @@ dp.include_router(routers)
 async def on_startup():
     try:
         logger.info("Запуск уведомлений")
-        asyncio.create_task(send_notifications(bot))
+        start_notifications(bot)
     except Exception as e:
         logger.error(f"Ошибка при запуске уведомлений: {str(e)}")
 
