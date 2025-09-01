@@ -125,9 +125,9 @@ async def send_notifications(bot: Bot):
 def start_notifications(bot: Bot):
     scheduler.add_job(
         send_notifications,
-        trigger=CronTrigger(day_of_week="mon-fri", hour="*", minute="*", timezone="Europe/Moscow"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow"),
         args=[bot],
         max_instances=1
     )
     scheduler.start()
-    logger.info("Уведомления запущены: каждую минуту в будние дни для теста")
+    logger.info("Уведомления запущены: будние дни, 15:00 МСК")
