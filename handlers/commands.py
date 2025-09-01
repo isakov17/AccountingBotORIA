@@ -1,4 +1,4 @@
-from aiogram import Router, Bot
+from aiogram import Router, Bot, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -9,6 +9,7 @@ from exceptions import (
     add_excluded_item,
     remove_excluded_item
 )
+from utils import redis_client
 from googleapiclient.errors import HttpError
 import logging
 import aiohttp
@@ -125,42 +126,60 @@ async def debug_sheets(message: Message):
         await message.answer(f"Неожиданная ошибка: {str(e)}")
         logger.error(f"Неожиданная ошибка /debug: {str(e)}, user_id={message.from_user.id}")
 
+
 @router.message(Command("add_user"))
-async def add_user(message: Message):
+async def add_user(message: types.Message):
     if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
         await message.answer("🚫 Доступ запрещен. Только администратор может добавлять пользователей.")
         logger.info(f"Доступ запрещен для /add_user: user_id={message.from_user.id}")
         return
     try:
-        args = message.text.split(maxsplit=1)
+        # Разделяем команду, сохраняя имя с пробелами
+        args = message.text.split(None, 1)
         if len(args) < 2:
-            await message.answer("❌ Укажите Telegram ID: /add_user [Telegram ID]")
+            await message.answer("❌ Укажите Telegram ID и Имя Фамилия: /add_user [Telegram ID] [Имя Фамилия]")
             logger.info(f"Некорректный формат /add_user: text={message.text}, user_id={message.from_user.id}")
             return
-        user_id_str = args[1]
+        parts = args[1].split(None, 1)
+        if len(parts) < 2:
+            await message.answer("❌ Укажите Telegram ID и Имя Фамилия: /add_user [Telegram ID] [Имя Фамилия]")
+            logger.info(f"Некорректный формат /add_user: text={message.text}, user_id={message.from_user.id}")
+            return
+        user_id_str, user_name = parts[0], parts[1].strip()
         if not user_id_str.isdigit():
             await message.answer("❌ Telegram ID должен содержать только цифры.")
             logger.info(f"Некорректный Telegram ID: {user_id_str}, user_id={message.from_user.id}")
             return
+        if not user_name:
+            await message.answer("❌ Имя Фамилия не может быть пустым.")
+            logger.info(f"Пустое имя: {user_name}, user_id={message.from_user.id}")
+            return
         user_id = int(user_id_str)
+
         # Получаем текущий список
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
         ).execute()
-        allowed_users = [int(row[0]) for row in result.get("values", [])[1:] if row and row[0].isdigit()]
-        if user_id in allowed_users:
+        allowed_users = [(int(row[0]), row[1] if len(row) > 1 else "") for row in result.get("values", [])[1:] if row and row[0].isdigit()]
+        if any(uid == user_id for uid, _ in allowed_users):
             await message.answer("✅ Пользователь уже в списке.")
             logger.info(f"Пользователь уже в списке: {user_id}, user_id={message.from_user.id}")
             return
+
         # Добавляем нового пользователя
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SHEET_NAME,
-            range="AllowedUsers!A:A",
+            range="AllowedUsers!A:B",
             valueInputOption="RAW",
-            body={"values": [[user_id_str]]}
+            body={"values": [[user_id_str, user_name]]}
         ).execute()
-        await message.answer(f"✅ Пользователь {user_id} добавлен.")
-        logger.info(f"Пользователь добавлен: {user_id}, user_id={message.from_user.id}")
+
+        # Очищаем кэш Redis
+        redis_client.delete("allowed_users")
+        logger.info("Кэш allowed_users очищен после добавления пользователя")
+
+        await message.answer(f"✅ Пользователь {user_id} ({user_name}) добавлен.")
+        logger.info(f"Пользователь добавлен: {user_id}, name={user_name}, user_id={message.from_user.id}")
     except HttpError as e:
         await message.answer(f"❌ Ошибка добавления пользователя в Google Sheets: {e.status_code} - {e.reason}.")
         logger.error(f"Ошибка /add_user: {e.status_code} - {e.reason}, user_id={message.from_user.id}")
@@ -169,57 +188,60 @@ async def add_user(message: Message):
         logger.error(f"Неожиданная ошибка /add_user: {str(e)}, user_id={message.from_user.id}")
 
 @router.message(Command("remove_user"))
-async def remove_user(message: Message):
+async def remove_user(message: types.Message):
     if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
         await message.answer("🚫 Доступ запрещен. Только администратор может удалять пользователей.")
         logger.info(f"Доступ запрещен для /remove_user: user_id={message.from_user.id}")
         return
     try:
-        args = message.text.split(maxsplit=1)
+        args = message.text.split(None, 1)
         if len(args) < 2:
-            await message.answer("❌ Укажите Telegram ID: /remove_user [Telegram ID]")
+            await message.answer("❌ Укажите Telegram ID или Имя Фамилия: /remove_user [Telegram ID или Имя Фамилия]")
             logger.info(f"Некорректный формат /remove_user: text={message.text}, user_id={message.from_user.id}")
             return
-        user_id_str = args[1]
-        if not user_id_str.isdigit():
-            await message.answer("❌ Telegram ID должен содержать только цифры.")
-            logger.info(f"Некорректный Telegram ID: {user_id_str}, user_id={message.from_user.id}")
-            return
-        user_id = int(user_id_str)
+        identifier = args[1].strip()
 
         # Получаем текущий список
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:A"
+            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
         ).execute()
         rows = result.get("values", [])
         
-        if len(rows) == 0:
+        if len(rows) <= 1:  # Только заголовок или пусто
             await message.answer("❌ Список пользователей пуст.")
-            logger.info(f"Список пуст при попытке удалить: {user_id}, user_id={message.from_user.id}")
+            logger.info(f"Список пуст при попытке удалить: {identifier}, user_id={message.from_user.id}")
             return
 
         # Проверяем, есть ли заголовок
-        header = rows[0] if rows else ["User ID"]  # предполагаем заголовок
+        header = rows[0] if rows else ["Users", "Name"]
         data_rows = rows[1:]
 
-        # Фильтруем: оставляем только тех, кто не совпадает с user_id
-        filtered_rows = [row for row in data_rows if not (row and row[0].isdigit() and int(row[0]) == user_id)]
+        # Фильтруем: удаляем строки, где совпадает user_id или имя
+        is_digit = identifier.isdigit()
+        filtered_rows = []
+        removed = False
+        for row in data_rows:
+            if not row or not row[0].isdigit():
+                continue
+            row_id, row_name = row[0], row[1] if len(row) > 1 else ""
+            if (is_digit and row_id == identifier) or (not is_digit and row_name.strip() == identifier):
+                removed = True
+                continue
+            filtered_rows.append(row)
 
-        if len(data_rows) == len(filtered_rows):
-            await message.answer("✅ Пользователь не найден в списке.")
-            logger.info(f"Пользователь не найден: {user_id}, user_id={message.from_user.id}")
+        if not removed:
+            await message.answer(f"✅ Пользователь {identifier} не найден в списке.")
+            logger.info(f"Пользователь не найден: {identifier}, user_id={message.from_user.id}")
             return
 
-        # Очищаем весь диапазон A:A, чтобы гарантировать удаление "хвостов"
+        # Очищаем весь диапазон A:B
         sheets_service.spreadsheets().values().clear(
             spreadsheetId=SHEET_NAME,
-            range="AllowedUsers!A:A"
+            range="AllowedUsers!A:B"
         ).execute()
 
-        # Подготавливаем новые данные: заголовок + отфильтрованные строки
+        # Записываем обратно заголовок и отфильтрованные строки
         new_values = [header] + filtered_rows
-
-        # Записываем обратно
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SHEET_NAME,
             range="AllowedUsers!A1",
@@ -227,8 +249,12 @@ async def remove_user(message: Message):
             body={"values": new_values}
         ).execute()
 
-        await message.answer(f"✅ Пользователь {user_id} удален из таблицы.")
-        logger.info(f"Пользователь удален: {user_id}, user_id={message.from_user.id}")
+        # Очищаем кэш Redis
+        redis_client.delete("allowed_users")
+        logger.info("Кэш allowed_users очищен после удаления пользователя")
+
+        await message.answer(f"✅ Пользователь {identifier} удален из таблицы.")
+        logger.info(f"Пользователь удален: {identifier}, user_id={message.from_user.id}")
 
     except HttpError as e:
         await message.answer(f"❌ Ошибка работы с Google Sheets: {e.status_code} - {e.reason}.")
@@ -304,7 +330,6 @@ async def summary_report(message: Message):
         logger.error(f"Неожиданная ошибка /summary: {str(e)}, user_id={message.from_user.id}")
         
         
-# ... (ваш существующий импорт и router)
 
 @router.message(Command("listexclusions"))
 async def list_exclusions_command(message: Message):
