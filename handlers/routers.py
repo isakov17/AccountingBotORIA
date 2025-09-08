@@ -202,25 +202,42 @@ async def process_customer(message: Message, state: FSMContext):
     logger.info(f"Заказчик принят: {customer}, user_id={message.from_user.id}")
 
 @router.callback_query(AddReceiptQR.SELECT_TYPE)
-async def process_receipt_type(callback, state: FSMContext):
+async def process_receipt_type(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
     data = await state.get_data()
-    parsed_data = data["parsed_data"]
-    total_sum = sum(item["sum"] for item in parsed_data["items"])
-    items_list = "\n".join([f"- {item['name']} (Сумма: {item['sum']:.2f} RUB)" for item in parsed_data["items"]])
+    parsed_data = data.get("parsed_data", {})
+    items = parsed_data.get("items", [])
+
+    total_sum = sum(float(item.get("sum", 0)) for item in items)
+    items_list = "\n".join([
+        f"- {item.get('name', '—')} "
+        f"(Сумма: {float(item.get('sum', 0)):.2f} RUB, "
+        f"Цена: {float(item.get('price', 0)):.2f} RUB, "
+        f"Кол-во: {item.get('quantity', 1)})"
+        for item in items
+    ])
+
     if callback.data == "type_store":
         receipt_type = "Полный"
-        delivery_date = ""
-        status = "Доставлено"
         receipt = {
-            "date": parsed_data["date"],
+            "date": parsed_data.get("date"),
             "store": parsed_data.get("store", "Неизвестно"),
-            "items": [{"name": item["name"], "sum": item["sum"]} for item in parsed_data["items"]],  # Положительная сумма
+            "items": [
+                {
+                    "name": item.get("name", "—"),
+                    "sum": item.get("sum", 0),
+                    "price": item.get("price", 0),
+                    "quantity": item.get("quantity", 1)
+                }
+                for item in items
+            ],
             "receipt_type": receipt_type,
-            "fiscal_doc": parsed_data["fiscal_doc"],
-            "qr_string": parsed_data["qr_string"],
-            "delivery_date": delivery_date,
-            "status": status,
-            "customer": data["customer"]
+            "fiscal_doc": parsed_data.get("fiscal_doc", ""),
+            "qr_string": parsed_data.get("qr_string", ""),
+            "delivery_date": "",
+            "status": "Доставлено",
+            "customer": data.get("customer", "Неизвестно")
         }
         details = (
             f"Детали чека:\n"
@@ -228,7 +245,7 @@ async def process_receipt_type(callback, state: FSMContext):
             f"Заказчик: {receipt['customer']}\n"
             f"Сумма: {total_sum:.2f} RUB\n"
             f"Товары:\n{items_list}\n"
-            f"Фискальный номер: {parsed_data['fiscal_doc']}"
+            f"Фискальный номер: {receipt['fiscal_doc']}"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
@@ -237,18 +254,27 @@ async def process_receipt_type(callback, state: FSMContext):
         await callback.message.answer(details, reply_markup=keyboard)
         await state.update_data(receipt=receipt)
         await state.set_state(AddReceiptQR.CONFIRM_ACTION)
+
     elif callback.data == "type_delivery":
         receipt_type = "Предоплата"
         await state.update_data(receipt_type=receipt_type)
-        items = parsed_data["items"]
         if len(items) == 1:
-            await callback.message.answer(f"Введите дату доставки для {items[0]['name']} Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.")
+            await callback.message.answer(
+                f"Введите дату доставки для {items[0].get('name', '—')} "
+                f"(ддммгг, например 110825) или /skip.",
+                reply_markup=reset_keyboard()
+            )
             await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         else:
             await state.update_data(current_item_index=0, delivery_dates=[])
-            await callback.message.answer(f"Введите дату доставки для {items[0]['name']} Используйте ддммгг (6 цифр, например 110825 для 11.08.2025) или /skip.")
+            await callback.message.answer(
+                f"Введите дату доставки для {items[0].get('name', '—')} "
+                f"(ддммгг, например 110825) или /skip.",
+                reply_markup=reset_keyboard()
+            )
             await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
-    await callback.answer()
+
+
 
 @router.message(AddReceiptQR.CONFIRM_DELIVERY_DATE)
 async def process_delivery_date(message: Message, state: FSMContext):
@@ -305,26 +331,26 @@ async def process_delivery_date(message: Message, state: FSMContext):
     await state.set_state(AddReceiptQR.WAIT_LINK)
 
 
-
 @router.message(AddReceiptQR.WAIT_LINK)
 async def process_receipt_link(message: Message, state: FSMContext):
     link = (message.text or "").strip()
 
-    # Требуем корректный http/https (ссылку нельзя пропустить)
     if not (link.startswith("http://") or link.startswith("https://")):
-        await message.answer("⚠️ Пожалуйста, отправьте корректную ссылку (http/https).", reply_markup=reset_keyboard())
+        await message.answer(
+            "⚠️ Пожалуйста, отправьте корректную ссылку (http/https).",
+            reply_markup=reset_keyboard()
+        )
         return
 
     data = await state.get_data()
-    parsed_data = data["parsed_data"]
-    items = parsed_data["items"]
-    receipt_type = data["receipt_type"]
+    parsed_data = data.get("parsed_data", {})
+    items = parsed_data.get("items", [])
+    receipt_type = data.get("receipt_type", "Покупка")
 
     current_item_index = data.get("current_item_index", 0)
     delivery_dates = data.get("delivery_dates", [])
     links = data.get("links", [])
 
-    # гарантируем длину списка ссылок до текущего индекса
     while len(links) < current_item_index:
         links.append("")
     if len(links) == current_item_index:
@@ -334,37 +360,52 @@ async def process_receipt_link(message: Message, state: FSMContext):
 
     await state.update_data(links=links)
 
-    # если есть следующий товар — спрашиваем его дату
+    # если есть следующий товар
     if current_item_index + 1 < len(items):
         next_index = current_item_index + 1
         await state.update_data(current_item_index=next_index)
         await message.answer(
-            f"Введите дату доставки для {items[next_index]['name']} "
+            f"Введите дату доставки для {items[next_index].get('name', '—')} "
             f"(ддммгг, например 110825) или /skip:",
             reply_markup=reset_keyboard()
         )
         await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         return
 
-    # иначе — все товары пройдены, формируем подтверждение
-    total_sum = sum(item["sum"] for item in items)
+    # все товары пройдены
+    total_sum = sum(float(item.get("sum", 0)) for item in items)
     rows = []
     for i, item in enumerate(items):
         d = delivery_dates[i] if i < len(delivery_dates) else ""
         l = links[i] if i < len(links) else ""
-        rows.append(f"- {item['name']} (Сумма: {item['sum']:.2f} RUB, Доставка: {d or '—'}, Ссылка: {l or '—'})")
+        rows.append(
+            f"- {item.get('name', '—')} "
+            f"(Сумма: {float(item.get('sum', 0)):.2f} RUB, "
+            f"Цена: {float(item.get('price', 0)):.2f} RUB, "
+            f"Кол-во: {item.get('quantity', 1)}, "
+            f"Доставка: {d or '—'}, "
+            f"Ссылка: {l or '—'})"
+        )
 
     receipt = {
-        "date": parsed_data["date"],
+        "date": parsed_data.get("date"),
         "store": parsed_data.get("store", "Неизвестно"),
-        "items": [{"name": item["name"], "sum": item["sum"]} for item in items],
+        "items": [
+            {
+                "name": item.get("name", "—"),
+                "sum": item.get("sum", 0),
+                "price": item.get("price", 0),
+                "quantity": item.get("quantity", 1)
+            }
+            for item in items
+        ],
         "receipt_type": receipt_type,
-        "fiscal_doc": parsed_data["fiscal_doc"],
-        "qr_string": parsed_data["qr_string"],
+        "fiscal_doc": parsed_data.get("fiscal_doc", ""),
+        "qr_string": parsed_data.get("qr_string", ""),
         "delivery_dates": delivery_dates,
-        "links": links,  # 👈 массив ссылок по позициям
+        "links": links,
         "status": "Ожидает",
-        "customer": data["customer"]
+        "customer": data.get("customer", "Неизвестно")
     }
 
     details = (
@@ -373,7 +414,7 @@ async def process_receipt_link(message: Message, state: FSMContext):
         f"Заказчик: {receipt['customer']}\n"
         f"Сумма: {total_sum:.2f} RUB\n"
         f"Товары:\n" + "\n".join(rows) + "\n"
-        f"Фискальный номер: {parsed_data['fiscal_doc']}"
+        f"Фискальный номер: {receipt['fiscal_doc']}"
     )
 
     inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -389,18 +430,17 @@ async def process_receipt_link(message: Message, state: FSMContext):
 
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "confirm_add")
 async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     loading_message = await callback.message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
 
     data = await state.get_data()
-    receipt = data["receipt"]
-    parsed_data = data["parsed_data"]
+    receipt = data.get("receipt", {})
+    parsed_data = data.get("parsed_data", {})
     user_name = await is_user_allowed(callback.from_user.id)
 
     if not user_name:
         await loading_message.edit_text("🚫 Доступ запрещен.")
-        logger.info(f"Доступ запрещен для confirm_add: user_id={callback.from_user.id}")
         await state.clear()
-        await callback.answer()
         return
 
     delivery_dates = receipt.get("delivery_dates", [])
@@ -409,20 +449,27 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     receipt_type_for_save = "Доставка" if is_delivery else "Покупка"
 
     ok, fail = 0, 0
-    for i, item in enumerate(receipt["items"]):
+    for i, item in enumerate(receipt.get("items", [])):
+        one_item = {
+            "name": item.get("name", "Неизвестно"),
+            "sum": item.get("sum", 0),
+            "price": item.get("price", 0),
+            "quantity": item.get("quantity", 1)
+        }
+
         one = {
-            "date": parsed_data["date"],
+            "date": parsed_data.get("date"),
             "store": parsed_data.get("store", "Неизвестно"),
-            "items": [{"name": item["name"], "sum": item["sum"]}],
+            "items": [one_item],
             "receipt_type": "Полный" if not is_delivery else "Доставка",
-            "fiscal_doc": parsed_data["fiscal_doc"],
-            "qr_string": parsed_data["qr_string"],
+            "fiscal_doc": parsed_data.get("fiscal_doc", ""),
+            "qr_string": parsed_data.get("qr_string", ""),
             "delivery_date": delivery_dates[i] if i < len(delivery_dates) else "",
             "status": "Ожидает" if is_delivery else "Доставлено",
-            "customer": receipt.get("customer", data.get("customer", "Неизвестно")),
+            "customer": receipt.get("customer", "Неизвестно"),
             "excluded_sum": parsed_data.get("excluded_sum", 0.0),
             "excluded_items": parsed_data.get("excluded_items", []),
-            "link": links[i] if i < len(links) else ""   # 👈 ссылка на товар в столбец N
+            "link": links[i] if i < len(links) else ""
         }
 
         saved = await save_receipt(one, user_name, callback.from_user.id, receipt_type=receipt_type_for_save)
@@ -431,34 +478,14 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         else:
             fail += 1
 
-    # Получаем текущий баланс
-    balance_data = await get_monthly_balance()
-    balance = balance_data.get("balance", 0.0) if balance_data else 0.0
-
     if ok and not fail:
-        await loading_message.edit_text(
-            f"✅ Чек {receipt['fiscal_doc']} добавлен (пользователь: {user_name}).\n"
-            f"Позиции: {ok}/{ok}.\n"
-            f"🟰 Текущий остаток: {balance:.2f} RUB"
-        )
+        await loading_message.edit_text(f"✅ Чек {parsed_data.get('fiscal_doc','')} добавлен. Позиции: {ok}/{ok}.")
     elif ok and fail:
-        await loading_message.edit_text(
-            f"⚠️ Чек {receipt['fiscal_doc']} добавлен частично (пользователь: {user_name}).\n"
-            f"Удалось: {ok}, ошибок: {fail}.\n"
-            f"🟰 Текущий остаток: {balance:.2f} RUB"
-        )
+        await loading_message.edit_text(f"⚠️ Чек {parsed_data.get('fiscal_doc','')} добавлен частично. Успешно: {ok}, ошибок: {fail}.")
     else:
-        await loading_message.edit_text(
-            f"❌ Не удалось сохранить чек {receipt['fiscal_doc']}. Попробуй ещё раз или /add_manual."
-        )
+        await loading_message.edit_text(f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc','')}.")
 
-    logger.info(
-        f"Чек подтвержден: fiscal_doc={receipt['fiscal_doc']}, saved={ok}, failed={fail}, "
-        f"balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
-    )
     await state.clear()
-    await callback.answer()
-
 
 
 
@@ -872,7 +899,6 @@ async def process_return_item(callback, state: FSMContext):
 
 @router.message(ReturnReceipt.UPLOAD_RETURN_QR)
 async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
-    # Отправляем сообщение о загрузке
     loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
 
     if not message.photo:
@@ -886,12 +912,12 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         logger.info(f"Ошибка обработки QR-кода для возврата: user_id={message.from_user.id}")
         return
 
-    if parsed_data["operation_type"] != 2:
+    if parsed_data.get("operation_type") != 2:
         await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=reset_keyboard())
-        logger.info(f"Некорректный чек для возврата: operation_type={parsed_data['operation_type']}, user_id={message.from_user.id}")
+        logger.info(f"Некорректный чек для возврата: operation_type={parsed_data.get('operation_type')}, user_id={message.from_user.id}")
         return
 
-    # === Новый блок: проверяем, что в чеке возврата реально есть нужный товар ===
+    # === Проверка товара ===
     data = await state.get_data()
     expected_item = (data or {}).get("item_name", "")
 
@@ -901,15 +927,14 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         return s
 
     tgt = norm(expected_item)
-    found_match = False
+    found_item = None
     for it in parsed_data.get("items", []):
         name = norm(it.get("name", ""))
-        # строгая проверка + «мягкая» (на случай различий артикулов/хвостов)
         if name == tgt or (tgt and (tgt in name or name in tgt)):
-            found_match = True
+            found_item = it
             break
 
-    if not found_match:
+    if not found_item:
         await loading_message.edit_text(f"Товар «{expected_item}» не найден в чеке возврата.", reply_markup=reset_keyboard())
         logger.info(
             "Товар не найден в чеке возврата: need=%s, got_items=%s, user_id=%s",
@@ -918,39 +943,54 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
             message.from_user.id
         )
         return
-    # === конец нового блока ===
 
-    new_fiscal_doc = parsed_data["fiscal_doc"]
+    new_fiscal_doc = parsed_data.get("fiscal_doc", "")
     if not await is_fiscal_doc_unique(new_fiscal_doc):
         await loading_message.edit_text(f"Чек с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=reset_keyboard())
         logger.info(f"Дубликат фискального номера: new_fiscal_doc={new_fiscal_doc}, user_id={message.from_user.id}")
         return
 
-    # Сохраняем данные для последующего подтверждения
-    data = await state.get_data()
-    fiscal_doc = data["fiscal_doc"]
-    item_name = data["item_name"]
-    total_sum = 0.0  # Будет обновлено при подтверждении
+    # Детали возврата
+    total_sum = float(found_item.get("sum", 0))
+    item_price = float(found_item.get("price", 0))
+    item_qty = float(found_item.get("quantity", 1))
+
+    store = parsed_data.get("store") or data.get("store", "Неизвестно")
+    customer = parsed_data.get("customer") or data.get("customer", "Неизвестно")
+
     details = (
-        f"Магазин: {data.get('store', 'Неизвестно')}\n"
-        f"Заказчик: {data.get('customer', 'Неизвестно')}\n"
-        f"Сумма: {total_sum:.2f} RUB\n"
-        f"Товар: {item_name}\n"
+        f"Магазин: {store}\n"
+        f"Заказчик: {customer}\n"
+        f"Сумма возврата: {total_sum:.2f} RUB\n"
+        f"Товар: {found_item.get('name', '—')}\n"
+        f"Цена за ед.: {item_price:.2f} RUB\n"
+        f"Количество: {item_qty}\n"
         f"Новый фискальный номер: {new_fiscal_doc}"
     )
+
     inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_return")],
         [InlineKeyboardButton(text="Отмена", callback_data="cancel_return")]
     ])
-    await loading_message.edit_text(f"Возврат товара {item_name} обработан. Детали:\n{details}\nПодтвердите или отмените действие:", reply_markup=inline_keyboard)
+
+    await loading_message.edit_text(
+        f"Возврат обработан. Детали:\n{details}\nПодтвердите или отмените действие:",
+        reply_markup=inline_keyboard
+    )
+
     await state.update_data(
         new_fiscal_doc=new_fiscal_doc,
         parsed_data=parsed_data,
-        fiscal_doc=fiscal_doc,
-        item_name=item_name
+        fiscal_doc=data.get("fiscal_doc"),
+        item_name=expected_item
     )
     await state.set_state(ReturnReceipt.CONFIRM_ACTION)
-    logger.info(f"Возврат подготовлен к подтверждению: old_fiscal_doc={fiscal_doc}, new_fiscal_doc={new_fiscal_doc}, item={item_name}, user_id={message.from_user.id}")
+
+    logger.info(
+        "Возврат подготовлен: old_fiscal_doc=%s, new_fiscal_doc=%s, item=%s, user_id=%s",
+        data.get("fiscal_doc"), new_fiscal_doc, expected_item, message.from_user.id
+    )
+
 
 # Обработчик подтверждения/отмены возврата
 @router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])

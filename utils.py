@@ -50,15 +50,20 @@ async def parse_qr_from_photo(bot, file_id):
 
                         for item in items:
                             name = item.get("name", "Неизвестно").strip()
-                            price = item.get("sum", 0) / 100
+                            total_sum = item.get("sum", 0) / 100        # общая сумма (рубли)
+                            unit_price = item.get("price", 0) / 100     # цена за единицу (рубли)
+                            quantity = item.get("quantity", 1)
+
                             if is_excluded(name):
-                                logger.info(f"Найден исключённый товар: '{name}' (цена: {price})")
-                                excluded_sum += price
+                                logger.info(f"Найден исключённый товар: '{name}' (сумма: {total_sum})")
+                                excluded_sum += total_sum
                                 continue
+
                             filtered_items.append({
                                 "name": name,
-                                "sum": price,
-                                "quantity": item.get("quantity", 1)
+                                "sum": total_sum,
+                                "price": unit_price,
+                                "quantity": quantity
                             })
 
                         total_sum = data_json.get("totalSum", 0) / 100
@@ -72,17 +77,22 @@ async def parse_qr_from_photo(bot, file_id):
                             "prepaid_sum": data_json.get("prepaidSum", 0) / 100,
                             "total_sum": total_sum,
                             "excluded_sum": excluded_sum,
-                            "excluded_items": [item.get("name") for item in items if is_excluded(item.get("name", "").strip())]
+                            "excluded_items": [
+                                item.get("name") for item in items if is_excluded(item.get("name", "").strip())
+                            ]
                         }
                     else:
                         logger.error("Нет данных JSON в ответе от proverkacheka.com")
                         return None
                 else:
-                    logger.error(f"Ошибка обработки на proverkacheka.com: code={result.get('code')}, message={result.get('data')}")
+                    logger.error(
+                        f"Ошибка обработки на proverkacheka.com: code={result.get('code')}, message={result.get('data')}"
+                    )
                     return None
             else:
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
+
 
 async def confirm_manual_api(data, user):
     logger.info(f"confirm_manual_api: Входные данные data={data}")
