@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
 from sheets import sheets_service, is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, save_receipt_summary
 from utils import parse_qr_from_photo, confirm_manual_api
-from handlers.notifications import send_group_notification
+from handlers.notifications import send_group_notification, safe_float, send_user_notification
 from googleapiclient.errors import HttpError
 import logging
 from datetime import datetime
@@ -449,7 +449,10 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
 
     if saved:
         balance_data = await get_monthly_balance()
-        balance = balance_data.get("balance", 0.0) if balance_data else 0.0
+        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+        delivery_date = receipt.get("delivery_dates", "Не указана")
+        if isinstance(delivery_date, list):
+            delivery_date = delivery_date[0] if delivery_date else "Не указана"
 
         await send_group_notification(
             bot=callback.bot,
@@ -457,25 +460,34 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
             items=receipt.get("items", []),
             user_name=user_name,
             fiscal_doc=parsed_data.get("fiscal_doc", ""),
-            delivery_date=receipt.get("delivery_dates", "Не указана"),
+            delivery_date=delivery_date,
             balance=balance,
-            links=receipt.get("links", [])  # ← здесь уже из P (Ссылка на товар)
+            links=receipt.get("links", [])
         )
 
-        await loading_message.edit_text(
-            f"✅ Чек {parsed_data.get('fiscal_doc', '')} добавлен.\n"
-            f"Позиций: {len(receipt.get('items', []))}."
+        await send_user_notification(
+            bot=callback.bot,
+            chat_id=callback.message.chat.id,
+            action="🆕 Чек добавлен",
+            items=receipt.get("items", []),
+            user_name=user_name,
+            fiscal_doc=parsed_data.get("fiscal_doc", ""),
+            delivery_date=delivery_date,
+            balance=balance,
+            links=receipt.get("links", [])
         )
-        
+
+        await loading_message.delete()
     else:
         await loading_message.edit_text(
-            f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc','')}."
+            f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc', '')}."
         )
 
+    logger.info(
+        f"Чек подтвержден: fiscal_doc={parsed_data.get('fiscal_doc', '')}, "
+        f"positions={len(receipt.get('items', []))}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
+    )
     await state.clear()
-
-
-
 
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "cancel_add")
 async def cancel_add_action(callback, state: FSMContext):
@@ -728,11 +740,11 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
     selected = sorted(list(data.get("selected", set())))
     sel_items = [items[i] for i in selected]
     parsed = data.get("qr_parsed", {})
-
     new_fd = parsed.get("fiscal_doc", "")
     qr_str = parsed.get("qr_string", "")
 
     ok, fail, errors = 0, 0, []
+    links = []
 
     for it in sel_items:
         row_index = it["row_index"]
@@ -744,10 +756,15 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             while len(row) < 16:
                 row.append("")
 
-            row[8]  = "Доставлено"   # I: статус
-            row[11] = "Полный"       # L: тип чека
-            row[12] = str(new_fd)    # M: fiscal_doc
-            row[13] = qr_str         # N: QR строка
+            row[8] = "Доставлено"  # I: статус
+            row[11] = "Полный"     # L: тип чека
+            row[12] = str(new_fd)  # M: fiscal_doc
+            row[13] = qr_str       # N: QR строка
+
+            # Извлекаем ссылку из столбца P
+            link = row[15].strip() if len(row) > 15 and row[15] else ""
+            if link:
+                links.append(link)
 
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SHEET_NAME,
@@ -756,7 +773,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
                 body={"values": [row]}
             ).execute()
 
-            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}")
+            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}, link={link}")
             ok += 1
         except HttpError as e:
             fail += 1
@@ -767,24 +784,36 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
 
     try:
         balance_data = await get_monthly_balance()
-        balance = balance_data.get("balance", 0.0) if balance_data else 0.0
-    except Exception:
+        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+    except Exception as e:
+        logger.error(f"Ошибка получения баланса: {str(e)}")
         balance = 0.0
 
-    if fail == 0:
-        await callback.message.edit_text(f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}.")
-        link = it.get("link", "")  # должно браться из столбца P в sel_items
+    user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
 
+    if fail == 0:
         await send_group_notification(
             bot=callback.bot,
             action="📦 Подтверждена доставка",
             items=sel_items,
-            user_name=callback.from_user.full_name,
+            user_name=user_name,
             fiscal_doc=new_fd,
             delivery_date=datetime.now().strftime("%d.%m.%Y"),
             balance=balance,
-            links=[link] if link else []   # ← только ссылка, без QR
-      )
+            links=links
+        )
+
+        await send_user_notification(
+            bot=callback.bot,
+            chat_id=callback.message.chat.id,
+            action="📦 Доставка подтверждена",
+            items=sel_items,
+            user_name=user_name,
+            fiscal_doc=new_fd,
+            delivery_date=datetime.now().strftime("%d.%m.%Y"),
+            balance=balance,
+            links=links
+        )
     else:
         details = "\n".join(errors[:10])
         more = f"\n…и ещё {len(errors)-10}" if len(errors) > 10 else ""
@@ -792,6 +821,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             f"⚠️ Частично: успешно {ok}, ошибок {fail}.\n{details}{more}\n🟰 Остаток: {balance:.2f} RUB"
         )
 
+    logger.info(f"Доставка подтверждена: fiscal_doc={new_fd}, ok={ok}, fail={fail}, user_id={callback.from_user.id}, links={links}")
     await state.clear()
     await callback.answer()
 # === КОНЕЦ БЛОКА /expenses ===
@@ -961,6 +991,7 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
     new_fiscal_doc = data.get("new_fiscal_doc")  # новый из QR возврата
     item_name = data.get("item_name")
     parsed_data = data.get("parsed_data")
+    user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
 
     if callback.data == "confirm_return":
         try:
@@ -984,40 +1015,71 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                     ).execute()
                     row_updated = True
 
-                    total_sum = float(row[2]) if row[2] else 0.0  # C: сумма
-                    await save_receipt_summary(parsed_data["date"], "Возврат", total_sum, f"{new_fiscal_doc} - {item_name}")
+                    total_sum = safe_float(row[2]) if row[2] else 0.0  # C: сумма
+                    try:
+                        balance_data = await get_monthly_balance()
+                        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+                    except Exception as e:
+                        logger.error(f"Ошибка получения баланса: {str(e)}")
+                        balance = 0.0
+
+                    items = [{"name": item_name, "sum": total_sum, "quantity": 1}]
+                    links = [row[15]] if len(row) > 15 and row[15] else []
+
+                    await save_receipt_summary(
+                        parsed_data["date"],
+                        "Возврат",
+                        total_sum,
+                        f"{new_fiscal_doc} - {item_name}"
+                    )
 
                     await send_group_notification(
                         bot=callback.bot,
                         action="↩️ Возврат товара",
-                        items=[{"name": item_name, "sum": total_sum, "quantity": 1}],
-                        user_name=parsed_data.get("user", "Неизвестно"),
+                        items=items,
+                        user_name=user_name,
                         fiscal_doc=new_fiscal_doc,
                         delivery_date=datetime.now().strftime("%d.%m.%Y"),
                         balance=balance,
-                        links=[row[15]] if len(row) > 15 and row[15] else []  # ← ссылка из столбца P
+                        links=links
                     )
 
-
-
-                    await callback.message.edit_text(
-                        f"Возврат товара «{item_name}» подтвержден.\nФискальный номер: {new_fiscal_doc}"
+                    await send_user_notification(
+                        bot=callback.bot,
+                        chat_id=callback.message.chat.id,
+                        action="↩️ Возврат подтверждён",
+                        items=items,
+                        user_name=user_name,
+                        fiscal_doc=new_fiscal_doc,
+                        delivery_date=datetime.now().strftime("%d.%m.%Y"),
+                        balance=balance,
+                        links=links
                     )
+
                     break
 
             if not row_updated:
                 await callback.message.edit_text(f"Товар {item_name} не найден для возврата.")
+                logger.info(
+                    f"Товар не найден для возврата: fiscal_doc={fiscal_doc}, item={item_name}, user_id={callback.from_user.id}"
+                )
+        except HttpError as e:
+            await callback.message.edit_text(f"Ошибка обновления данных в Google Sheets: {e.status_code} - {e.reason}")
+            logger.error(f"Ошибка обработки возврата: {e.status_code} - {e.reason}, user_id={callback.from_user.id}")
         except Exception as e:
-            await callback.message.edit_text(f"Ошибка при подтверждении возврата: {e}")
+            await callback.message.edit_text(f"Неожиданная ошибка: {str(e)}")
+            logger.error(f"Неожиданная ошибка обработки возврата: {str(e)}, user_id={callback.from_user.id}")
     else:
         await callback.message.edit_text(
             f"Возврат товара {item_name} отменен.\nФискальный номер {new_fiscal_doc} не сохранен."
         )
+        logger.info(
+            f"Возврат отменен: old_fiscal_doc={fiscal_doc}, new_fiscal_doc={new_fiscal_doc}, "
+            f"item={item_name}, user_id={callback.from_user.id}"
+        )
 
     await state.clear()
     await callback.answer()
-
-
 
 
 @router.callback_query(ReturnReceipt.CONFIRM_ACTION)

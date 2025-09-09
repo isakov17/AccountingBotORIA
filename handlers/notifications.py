@@ -8,6 +8,7 @@ import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sheets import get_monthly_balance
 
 logger = logging.getLogger("AccountingBot")
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -26,6 +27,62 @@ def safe_float(value: str | float | int, default: float = 0.0) -> float:
     except Exception:
         return default
     return default
+
+async def send_user_notification(
+    bot: Bot,
+    chat_id: int,
+    action: str,
+    items: list[dict],
+    user_name: str,
+    fiscal_doc: str,
+    delivery_date: str,
+    balance: float,
+    links: list[str] | None = None,
+):
+    """
+    Универсальное уведомление пользователю в личный чат
+    """
+    try:
+        # Нормализуем товары
+        normalized_items = []
+        for it in items:
+            normalized_items.append({
+                "name": it.get("name", "—"),
+                "sum": safe_float(it.get("sum", 0)),
+                "quantity": int(it.get("quantity", 1) or 1)
+            })
+
+        total_sum = sum(it["sum"] for it in normalized_items)
+        total_qty = sum(it["quantity"] for it in normalized_items)
+
+        # Строки с товарами
+        items_text = "\n".join(
+            [
+                f"  • {it['name']} — {it['quantity']} шт. × {it['sum']:.2f} ₽"
+                for it in normalized_items
+            ]
+        )
+
+        links_text = "\n".join([f"🔗 {link}" for link in links]) if links else ""
+
+        text = (
+            f"{action}\n\n"
+            f"👤 Пользователь: {user_name}\n"
+            f"📑 Фискальный номер: {fiscal_doc}\n"
+            f"📅 Дата доставки: {delivery_date}\n\n"
+            f"🛒 Товары ({len(normalized_items)} шт.):\n{items_text}\n\n"
+            f"📦 Всего позиций: {total_qty}\n"
+            f"💰 Общая сумма: {total_sum:.2f} ₽\n"
+            f"💳 Баланс: {balance:.2f} ₽\n"
+            f"{links_text}"
+        )
+
+        await bot.send_message(chat_id, text)
+        logger.info(f"Уведомление отправлено пользователю: {action}, чек={fiscal_doc}, chat_id={chat_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомления пользователю: {str(e)}, chat_id={chat_id}")
+
 
 async def send_group_notification(
     bot: Bot,
@@ -126,6 +183,7 @@ async def send_notifications(bot: Bot):
             # Условие: статус "ожидает" и дата доставки сегодня или 3 дня назад
             if status == "ожидает" and delivery_date in [today_str, three_days_ago]:
                 if notification_key not in notified_items:
+                    balance_data = await get_monthly_balance()
                     await send_group_notification(
                         bot=bot,
                         action="📦 Напоминание о доставке",
@@ -133,7 +191,7 @@ async def send_notifications(bot: Bot):
                         user_name=user_name,
                         fiscal_doc=fiscal_doc,
                         delivery_date=delivery_date,
-                        balance=balance,
+                        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0,
                         links=[link] if link else []
                     )
                     notified_items.add(notification_key)
