@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
 from sheets import sheets_service, is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, save_receipt_summary
 from utils import parse_qr_from_photo, confirm_manual_api
+from handlers.notifications import send_group_notification
 from googleapiclient.errors import HttpError
 import logging
 from datetime import datetime
@@ -447,10 +448,25 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     saved = await save_receipt(receipt, user_name=user_name)
 
     if saved:
+        balance_data = await get_monthly_balance()
+        balance = balance_data.get("balance", 0.0) if balance_data else 0.0
+
+        await send_group_notification(
+            bot=callback.bot,
+            action="🆕 Добавлен чек",
+            items=receipt.get("items", []),
+            user_name=user_name,
+            fiscal_doc=parsed_data.get("fiscal_doc", ""),
+            delivery_date=receipt.get("delivery_dates", "Не указана"),
+            balance=balance,
+            links=receipt.get("links", [])  # ← здесь уже из P (Ссылка на товар)
+        )
+
         await loading_message.edit_text(
             f"✅ Чек {parsed_data.get('fiscal_doc', '')} добавлен.\n"
             f"Позиций: {len(receipt.get('items', []))}."
         )
+        
     else:
         await loading_message.edit_text(
             f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc','')}."
@@ -469,9 +485,6 @@ async def cancel_add_action(callback, state: FSMContext):
     await callback.answer()
     
         
-
-# === МУЛЬТИВЫБОР ПОДТВЕРЖДЕНИЯ ДОСТАВКИ /expenses ===
-from aiogram import F
 
 # === МУЛЬТИВЫБОР ПОДТВЕРЖДЕНИЯ ДОСТАВКИ /expenses ===
 from aiogram import F
@@ -760,6 +773,18 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
 
     if fail == 0:
         await callback.message.edit_text(f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}.")
+        link = it.get("link", "")  # должно браться из столбца P в sel_items
+
+        await send_group_notification(
+            bot=callback.bot,
+            action="📦 Подтверждена доставка",
+            items=sel_items,
+            user_name=callback.from_user.full_name,
+            fiscal_doc=new_fd,
+            delivery_date=datetime.now().strftime("%d.%m.%Y"),
+            balance=balance,
+            links=[link] if link else []   # ← только ссылка, без QR
+      )
     else:
         details = "\n".join(errors[:10])
         more = f"\n…и ещё {len(errors)-10}" if len(errors) > 10 else ""
@@ -961,6 +986,19 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
 
                     total_sum = float(row[2]) if row[2] else 0.0  # C: сумма
                     await save_receipt_summary(parsed_data["date"], "Возврат", total_sum, f"{new_fiscal_doc} - {item_name}")
+
+                    await send_group_notification(
+                        bot=callback.bot,
+                        action="↩️ Возврат товара",
+                        items=[{"name": item_name, "sum": total_sum, "quantity": 1}],
+                        user_name=parsed_data.get("user", "Неизвестно"),
+                        fiscal_doc=new_fiscal_doc,
+                        delivery_date=datetime.now().strftime("%d.%m.%Y"),
+                        balance=balance,
+                        links=[row[15]] if len(row) > 15 and row[15] else []  # ← ссылка из столбца P
+                    )
+
+
 
                     await callback.message.edit_text(
                         f"Возврат товара «{item_name}» подтвержден.\nФискальный номер: {new_fiscal_doc}"

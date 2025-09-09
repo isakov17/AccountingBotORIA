@@ -1,39 +1,92 @@
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from googleapiclient.errors import HttpError
 from sheets import sheets_service
-from config import SHEET_NAME, YOUR_ADMIN_ID, USER_ID_1, USER_ID_2
+from config import SHEET_NAME, GROUP_CHAT_ID
 from datetime import datetime, timedelta
 import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from utils import redis_client, cache_get, cache_set
+from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger("AccountingBot")
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 notified_items = set()
 
-async def get_allowed_users() -> dict:
-    cache_key = "allowed_users"
-    cached_users = await cache_get(cache_key)
-    if cached_users is not None:
-        logger.info("Cache hit for allowed_users")
-        return cached_users
-
+def safe_float(value: str | float | int, default: float = 0.0) -> float:
+    """
+    Безопасное преобразование строки/числа в float
+    Заменяет запятые на точки, отсекает пробелы
+    """
     try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="AllowedUsers!A:B"
-        ).execute()
-        users = {int(row[0]): row[1] for row in result.get("values", [])[1:] if row and row[0].isdigit()}
-        await cache_set(cache_key, users, expire=86400)  # Кэш на 24 часа
-        logger.info("Allowed users cached")
-        return users
-    except HttpError as e:
-        logger.error(f"Ошибка получения AllowedUsers: {e.status_code} - {e.reason}")
-        return {}
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            return float(value.replace(",", ".").strip())
+    except Exception:
+        return default
+    return default
+
+async def send_group_notification(
+    bot: Bot,
+    action: str,
+    items: list[dict],
+    user_name: str,
+    fiscal_doc: str,
+    delivery_date: str,
+    balance: float,
+    links: list[str] | None = None,
+):
+    """
+    Универсальное уведомление в группу
+    """
+    try:
+        # Нормализуем товары
+        normalized_items = []
+        for it in items:
+            normalized_items.append({
+                "name": it.get("name", "—"),
+                "sum": safe_float(it.get("sum", 0)),
+                "quantity": int(it.get("quantity", 1) or 1)
+            })
+
+        total_sum = sum(it["sum"] for it in normalized_items)
+        total_qty = sum(it["quantity"] for it in normalized_items)
+
+        # Строки с товарами
+        items_text = "\n".join(
+            [
+                f"  • {it['name']} — {it['quantity']} шт. × {it['sum']:.2f} ₽"
+                for it in normalized_items
+            ]
+        )
+
+        links_text = "\n".join([f"🔗 {link}" for link in links]) if links else ""
+
+        text = (
+            f"{action}\n\n"
+            f"👤 Пользователь: {user_name}\n"
+            f"📑 Фискальный номер: {fiscal_doc}\n"
+            f"📅 Дата доставки: {delivery_date}\n\n"
+            f"🛒 Товары ({len(normalized_items)} шт.):\n{items_text}\n\n"
+            f"📦 Всего позиций: {total_qty}\n"
+            f"💰 Общая сумма: {total_sum:.2f} ₽\n"
+            f"💳 Баланс: {balance:.2f} ₽\n"
+            f"{links_text}"
+        )
+
+        # Добавляем кнопку перехода в бота
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Открыть бота", url="https://t.me/TESTAccountingORIABot")]
+            ]
+        )
+
+        await bot.send_message(GROUP_CHAT_ID, text, reply_markup=keyboard)
+        logger.info(f"Уведомление отправлено: {action}, чек={fiscal_doc}")
+
     except Exception as e:
-        logger.error(f"Неожиданная ошибка получения AllowedUsers: {str(e)}")
-        return {}
+        logger.error(f"Ошибка при отправке уведомления в группу: {str(e)}")
 
 async def send_notifications(bot: Bot):
     logger.info("Начало выполнения send_notifications")
@@ -43,77 +96,47 @@ async def send_notifications(bot: Bot):
         return
 
     try:
-        cache_key = "notifications:pending_checks"
-        cached_checks = await cache_get(cache_key)
-        if cached_checks is not None:
-            logger.info(f"Cache hit for pending checks: {len(cached_checks)} чеков")
-            checks = cached_checks
-        else:
-            result = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SHEET_NAME, range="Чеки!A:N"
-            ).execute()
-            raw_checks = result.get("values", [])[1:]  # Пропускаем заголовок
-            logger.info(f"Загружено {len(raw_checks)} строк из Google Sheets")
-            
-            checks = []
-            for index, row in enumerate(raw_checks, start=2):
-                # Проверяем длину строки и нормализуем данные
-                if len(row) < 7:
-                    logger.warning(f"Недостаточно столбцов в строке {index}: {row}")
-                    continue
-                status = row[6].strip().lower() if row[6] else ""
-                delivery_date = row[5].strip() if len(row) > 5 and row[5] else ""
-                if status == "ожидает" and delivery_date:
-                    checks.append(row + [str(index)])
-                else:
-                    logger.info(f"Пропущена строка {index}: status={status}, delivery_date={delivery_date}")
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEET_NAME, range="Чеки!A:P"
+        ).execute()
+        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        logger.info(f"Загружено {len(rows)} строк из Google Sheets")
 
-            await cache_set(cache_key, checks, expire=10800)  # Кэш на 3 часа
-            logger.info(f"Pending checks cached: {len(checks)} чеков")
-
-        if not checks:
-            logger.info("Нет чеков для уведомлений")
+        if not rows:
             return
 
-        today_date = today.strftime("%d.%m.%Y")
+        today_str = today.strftime("%d.%m.%Y")
         three_days_ago = (today - timedelta(days=3)).strftime("%d.%m.%Y")
-        logger.info(f"Проверка уведомлений: today_date={today_date}, three_days_ago={three_days_ago}")
-        allowed_users = await get_allowed_users()
-        if not allowed_users:
-            logger.warning("Список разрешённых пользователей пуст")
-            return
 
-        for row in checks:
-            delivery_date = row[5].strip() if len(row) > 5 else ""  # Столбец F
-            fiscal_doc = row[10].strip() if len(row) > 10 else ""  # Столбец K
-            item_name = row[8].strip() if len(row) > 8 else ""  # Столбец I
-            user_name = row[3].strip() if len(row) > 3 else ""  # Столбец D
-            link = row[13].strip() if len(row) > 13 else ""  # Столбец N
-            notification_key = f"{fiscal_doc}_{row[-1]}"  # Индекс строки
+        for idx, row in enumerate(rows, start=2):
+            if len(row) < 13:
+                continue
 
-            logger.info(f"Обработка чека: fiscal_doc={fiscal_doc}, delivery_date={delivery_date}, notification_key={notification_key}")
+            status = row[8].strip().lower() if row[8] else ""  # I: статус
+            delivery_date = row[7].strip() if row[7] else ""   # H: дата доставки
+            fiscal_doc = row[12].strip() if row[12] else ""    # M: fiscal_doc
+            item_name = row[10].strip() if row[10] else ""     # K: товар
+            user_name = row[5].strip() if row[5] else ""       # F: пользователь
+            item_sum = safe_float(row[2]) if row[2] else 0.0   # C: сумма
+            qty = int(row[4]) if row[4] else 1                 # E: количество
+            link = row[15].strip() if len(row) > 15 else ""    # P: ссылка
+            balance = safe_float(row[3]) if len(row) > 3 and row[3] else 0.0  # D: баланс
+            notification_key = f"{fiscal_doc}_{idx}"
 
-            if delivery_date in [today_date, three_days_ago] and notification_key not in notified_items:
-                recipients = {YOUR_ADMIN_ID, USER_ID_1, USER_ID_2}
-                check_user_id = next((uid for uid, name in allowed_users.items() if name.strip() == user_name), None)
-                if check_user_id and check_user_id in allowed_users:
-                    recipients.add(check_user_id)
-                else:
-                    logger.warning(f"Пользователь {user_name} не найден в AllowedUsers")
-
-                logger.info(f"Получатели уведомления: {recipients}")
-                for user_id in recipients:
-                    try:
-                        await bot.send_message(
-                            user_id,
-                            f"Напоминание: товар {item_name} из чека {fiscal_doc} ожидает доставку {delivery_date}. "
-                            f"Ссылка: {link}\n"
-                            f"Подтвердить доставку: /expenses"
-                        )
-                        logger.info(f"Уведомление отправлено: fiscal_doc={fiscal_doc}, item={item_name}, user_id={user_id}")
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {str(e)}")
-                notified_items.add(notification_key)
+            # Условие: статус "ожидает" и дата доставки сегодня или 3 дня назад
+            if status == "ожидает" and delivery_date in [today_str, three_days_ago]:
+                if notification_key not in notified_items:
+                    await send_group_notification(
+                        bot=bot,
+                        action="📦 Напоминание о доставке",
+                        items=[{"name": item_name, "sum": item_sum, "quantity": qty}],
+                        user_name=user_name,
+                        fiscal_doc=fiscal_doc,
+                        delivery_date=delivery_date,
+                        balance=balance,
+                        links=[link] if link else []
+                    )
+                    notified_items.add(notification_key)
 
     except HttpError as e:
         logger.error(f"Ошибка получения чеков: {e.status_code} - {e.reason}")
@@ -125,9 +148,20 @@ async def send_notifications(bot: Bot):
 def start_notifications(bot: Bot):
     scheduler.add_job(
         send_notifications,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow"),
+        trigger=IntervalTrigger(minutes=1),
         args=[bot],
         max_instances=1
     )
     scheduler.start()
-    logger.info("Уведомления запущены: будние дни, 15:00 МСК")
+    logger.info("Уведомления запущены: каждая минута (тестовый режим)")
+
+
+# def start_notifications(bot: Bot):
+#     scheduler.add_job(
+#         send_notifications,
+#         trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow"),
+#         args=[bot],
+#         max_instances=1
+#     )
+#     scheduler.start()
+#     logger.info("Уведомления запущены: будние дни, 15:00 МСК")

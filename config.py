@@ -10,6 +10,7 @@ load_dotenv()
 YOUR_ADMIN_ID = int(os.getenv("YOUR_ADMIN_ID")) if os.getenv("YOUR_ADMIN_ID") else None
 USER_ID_1 = int(os.getenv("USER_ID_1")) if os.getenv("USER_ID_1") else None
 USER_ID_2 = int(os.getenv("USER_ID_2")) if os.getenv("USER_ID_2") else None
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID")) if os.getenv("GROUP_CHAT_ID") else None
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SHEET_NAME = os.getenv("SHEET_NAME")
 PROVERKACHEKA_TOKEN = os.getenv("PROVERKACHEKA_TOKEN")
