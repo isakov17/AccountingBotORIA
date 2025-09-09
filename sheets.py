@@ -79,14 +79,10 @@ async def save_receipt(
     """
     Сохраняет чек в Google Sheets:
     - Все товары одним батчем в 'Чеки'
-    - Сводка обновляется построчно
-    - Исключённые товары пишутся только в 'Сводка' как 'Услуга'
+    - Все строки сводки одним батчем в 'Сводка'
     """
     if data_or_parsed is None:
-        if "parsed_data" in kwargs:
-            data_or_parsed = kwargs["parsed_data"]
-        elif "receipt" in kwargs:
-            data_or_parsed = kwargs["receipt"]
+        data_or_parsed = kwargs.get("parsed_data") or kwargs.get("receipt")
 
     try:
         data = data_or_parsed or {}
@@ -118,14 +114,17 @@ async def save_receipt(
         date_for_sheet = _normalize_date(raw_date)
         added_at = datetime.now().strftime("%d.%m.%Y")
 
-        # === собираем все строки разом ===
-        rows = []
+        # === собираем все строки ===
+        rows_checks = []
+        rows_summary = []
+
         for i, item in enumerate(data.get("items", [])):
             item_name = item.get("name", "Неизвестно")
             item_sum = float(item.get("sum", 0))
             item_qty = float(item.get("quantity", 1)) or 1
             item_price = float(item.get("price", 0)) or (item_sum / item_qty)
 
+            # Чеки
             row = [
                 added_at,                     # A Дата добавления
                 date_for_sheet,               # B Дата покупки
@@ -144,35 +143,47 @@ async def save_receipt(
                 "",                           # O QR возврата
                 links[i] if i < len(links) else ""  # P Ссылка
             ]
-            rows.append(row)
+            rows_checks.append(row)
 
-            # Пишем в сводку (расход всегда отрицательный)
-            await save_receipt_summary(
-                date=date_for_sheet,
-                operation_type="Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                sum_value=-abs(item_sum),
-                note=f"{fiscal_doc} - {item_name}"
-            )
+            # Сводка (расход всегда отрицательный)
+            rows_summary.append([
+                date_for_sheet,
+                "Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
+                "",                       # Доход
+                abs(item_sum),            # Расход
+                f"{fiscal_doc} - {item_name}"  # Комментарий
+            ])
 
-        # === один запрос ===
+        # Исключённые товары → в Сводку как Услуга
+        if data.get("excluded_sum", 0) > 0:
+            rows_summary.append([
+                date_for_sheet,
+                "Услуга",
+                "",  # Доход
+                abs(data["excluded_sum"]),
+                f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
+            ])
+
+        # === один запрос в Чеки ===
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SHEET_NAME,
             range="Чеки!A:P",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": rows},
+            body={"values": rows_checks},
         ).execute()
 
-        # Исключённые товары
-        if data.get("excluded_sum", 0) > 0:
-            await save_receipt_summary(
-                date=date_for_sheet,
-                operation_type="Услуга",
-                sum_value=-abs(data["excluded_sum"]),
-                note=f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
-            )
+        # === один запрос в Сводку ===
+        if rows_summary:
+            sheets_service.spreadsheets().values().append(
+                spreadsheetId=SHEET_NAME,
+                range="Сводка!A:E",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows_summary},
+            ).execute()
 
-        logger.info(f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, позиций={len(rows)}, user={user_name}")
+        logger.info(f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, позиций={len(rows_checks)}, user={user_name}")
         return True
 
     except Exception as e:

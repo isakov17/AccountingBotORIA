@@ -473,6 +473,9 @@ async def cancel_add_action(callback, state: FSMContext):
 # === МУЛЬТИВЫБОР ПОДТВЕРЖДЕНИЯ ДОСТАВКИ /expenses ===
 from aiogram import F
 
+# === МУЛЬТИВЫБОР ПОДТВЕРЖДЕНИЯ ДОСТАВКИ /expenses ===
+from aiogram import F
+
 # Состояния потока подтверждения доставки (мультивыбор)
 
 def _norm_name(s: str) -> str:
@@ -480,15 +483,10 @@ def _norm_name(s: str) -> str:
     return " ".join(s.split())
 
 def _rub(val) -> float:
-    """
-    Аккуратно приводим сумму из QR к рублям.
-    Поддерживаем: sum (в рублях/копейках) или price*quantity.
-    """
     if val is None:
         return 0.0
     try:
         v = float(val)
-        # простая эвристика: если очень большое целое — вероятно, копейки
         return v/100.0 if (v > 500 and float(v).is_integer()) else v
     except Exception:
         return 0.0
@@ -509,17 +507,17 @@ async def list_pending_receipts(message: Message, state: FSMContext):
 
     try:
         res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Чеки!A:M"
+            spreadsheetId=SHEET_NAME, range="Чеки!A:P"
         ).execute()
-        rows = res.get("values", [])[1:]  # пропускаем заголовок
+        rows = res.get("values", [])[1:]
 
-        groups = {}  # fiscal_doc -> list[{row_index,name,sum,date,user,store}]
+        groups = {}
         for i, row in enumerate(rows, start=2):
-            status = (row[6] if len(row) > 6 else "").strip().lower()
+            status = (row[8] if len(row) > 8 else "").strip().lower()   # I: статус
             if status != "ожидает":
                 continue
-            fiscal_doc = (row[10] if len(row) > 10 else "").strip()
-            item_name  = (row[8] if len(row) > 8 else "").strip()
+            fiscal_doc = (row[12] if len(row) > 12 else "").strip()     # M: fiscal_doc
+            item_name  = (row[10] if len(row) > 10 else "").strip()     # K: товар
             if not fiscal_doc or not item_name:
                 continue
             try:
@@ -530,21 +528,19 @@ async def list_pending_receipts(message: Message, state: FSMContext):
                 "row_index": i,
                 "name": item_name,
                 "sum": item_sum,
-                "date": row[1] if len(row) > 1 else "",
-                "user": row[3] if len(row) > 3 else "",
-                "store": row[4] if len(row) > 4 else ""
+                "date": row[1] if len(row) > 1 else "",   # B: дата покупки
+                "user": row[5] if len(row) > 5 else "",   # F: пользователь
+                "store": row[6] if len(row) > 6 else ""   # G: магазин
             })
 
         if not groups:
             await message.answer("Нет чеков со статусом «Ожидает».")
             return
 
-        kb_rows = []
-        for fd, items in groups.items():
-            kb_rows.append([
-                InlineKeyboardButton(text=f"{fd} — позиций: {len(items)}",
-                                     callback_data=f"choose_fd:{fd}")
-            ])
+        kb_rows = [
+            [InlineKeyboardButton(text=f"{fd} — позиций: {len(items)}", callback_data=f"choose_fd:{fd}")]
+            for fd, items in groups.items()
+        ]
 
         await state.update_data(pending_groups=groups)
         await message.answer(
@@ -560,7 +556,7 @@ async def list_pending_receipts(message: Message, state: FSMContext):
 # 2) Выбор конкретного чека → мультивыбор позиций
 @router.callback_query(ConfirmDelivery.SELECT_RECEIPT, F.data.startswith("choose_fd:"))
 async def choose_receipt(callback: CallbackQuery, state: FSMContext):
-    fiscal_doc = callback.data.split(":", 1)[-1]  # БЕЗ int(...), чистая строка
+    fiscal_doc = callback.data.split(":", 1)[-1]
     data = await state.get_data()
     groups = data.get("pending_groups", {})
     items = groups.get(fiscal_doc, [])
@@ -569,10 +565,8 @@ async def choose_receipt(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # сохраняем в состоянии список позиций этого чека
     await state.update_data(items=items, selected=set(), fd=fiscal_doc)
 
-    # строим клавиатуру с переключателями
     def build_kb(items, selected_idxs):
         rows = []
         for idx, it in enumerate(items):
@@ -595,7 +589,7 @@ async def choose_receipt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConfirmDelivery.SELECT_ITEMS)
     await callback.answer()
 
-# 3) Тоггл/готово/отмена для мультивыбора
+# 3) Тоггл/готово/отмена
 @router.callback_query(ConfirmDelivery.SELECT_ITEMS, F.data.startswith("sel:"))
 async def select_items_toggle(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -619,7 +613,6 @@ async def select_items_toggle(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # sel:toggle:{idx}
     try:
         _, _, sidx = cmd.split(":", 2)
         idx = int(sidx)
@@ -634,7 +627,6 @@ async def select_items_toggle(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Некорректный индекс.", show_alert=True)
         return
 
-    # перестраиваем клавиатуру
     def build_kb(items, selected_idxs):
         rows = []
         for i, it in enumerate(items):
@@ -653,7 +645,7 @@ async def select_items_toggle(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
-# 4) Загрузка QR полного расчёта и проверка соответствия выбранных позиций
+# 4) Загрузка QR и проверка
 @router.message(ConfirmDelivery.UPLOAD_FULL_QR)
 async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
     loading = await message.answer("⌛ Проверяю чек...")
@@ -667,7 +659,6 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
         await loading.edit_text("Не удалось распознать QR. Проверьте качество фото.")
         return
 
-    # Только ПОЛНЫЙ расчёт
     if parsed.get("operation_type") != 1:
         await loading.edit_text("Это не чек полного расчёта (operationType должен быть 1).")
         return
@@ -677,19 +668,15 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
     selected = sorted(list(data.get("selected", set())))
     sel_items = [items[i] for i in selected]
 
-    # Сверяем названия и суммы (строгий матч по имени, допускаем «вхождения»; сумма ±2 коп.)
     qr_items = parsed.get("items", [])
     missing = []
     for it in sel_items:
         need_name = _norm_name(it["name"])
-        matched = False
-        for q in qr_items:
-            q_name = _norm_name(q.get("name", ""))
-            if not q_name:
-                continue
-            if q_name == need_name or (need_name in q_name or q_name in need_name):
-                matched = True
-                break
+        matched = any(
+            q_name and (q_name == need_name or need_name in q_name or q_name in need_name)
+            for q in qr_items
+            for q_name in [_norm_name(q.get("name", ""))]
+        )
         if not matched:
             missing.append(it["name"])
 
@@ -700,7 +687,6 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    # Успех — сохраняем распарсенный чек и показываем подтверждение
     await state.update_data(qr_parsed=parsed)
     total = sum(it["sum"] for it in sel_items)
     details = [
@@ -715,7 +701,7 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot):
     await loading.edit_text("✅ Проверка пройдена.\n" + "\n".join(details), reply_markup=kb)
     await state.set_state(ConfirmDelivery.CONFIRM_ACTION)
 
-# 5) Финальное подтверждение — обновляем строки «Чеки» и пишем «Сводка»
+# 5) Финальное подтверждение
 @router.callback_query(ConfirmDelivery.CONFIRM_ACTION, F.data.in_(["confirm:delivery_many", "confirm:cancel"]))
 async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
     if callback.data == "confirm:cancel":
@@ -733,35 +719,31 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
     new_fd = parsed.get("fiscal_doc", "")
     qr_str = parsed.get("qr_string", "")
 
-    ok, fail = 0, 0
-    errors = []
+    ok, fail, errors = 0, 0, []
 
-    # Обновляем строки в «Чеки» без записи в «Сводка»
     for it in sel_items:
         row_index = it["row_index"]
         try:
-            # Читаем текущую строку
             res = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SHEET_NAME, range=f"Чеки!A{row_index}:M{row_index}"
+                spreadsheetId=SHEET_NAME, range=f"Чеки!A{row_index}:P{row_index}"
             ).execute()
             row = res.get("values", [[]])[0] if res.get("values") else []
-            while len(row) < 13:
+            while len(row) < 16:
                 row.append("")
 
-            # Обновляем поля
-            row[6] = "Доставлено"  # G: статус
-            row[9] = "Полный"      # J: тип чека
-            row[10] = str(new_fd)  # K: fiscal_doc полного чека
-            row[11] = qr_str       # L: QR-строка полного расчёта
+            row[8]  = "Доставлено"   # I: статус
+            row[11] = "Полный"       # L: тип чека
+            row[12] = str(new_fd)    # M: fiscal_doc
+            row[13] = qr_str         # N: QR строка
 
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SHEET_NAME,
-                range=f"Чеки!A{row_index}:M{row_index}",
+                range=f"Чеки!A{row_index}:P{row_index}",
                 valueInputOption="RAW",
                 body={"values": [row]}
             ).execute()
 
-            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}, qr_string={qr_str}")
+            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}")
             ok += 1
         except HttpError as e:
             fail += 1
@@ -770,7 +752,6 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             fail += 1
             errors.append(f"Строка {row_index}: {str(e)}")
 
-    # Баланс после обновления
     try:
         balance_data = await get_monthly_balance()
         balance = balance_data.get("balance", 0.0) if balance_data else 0.0
@@ -778,9 +759,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
         balance = 0.0
 
     if fail == 0:
-        await callback.message.edit_text(
-            f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}."
-        )
+        await callback.message.edit_text(f"✅ Подтверждено: {ok}/{ok}. Чек {new_fd}.")
     else:
         details = "\n".join(errors[:10])
         more = f"\n…и ещё {len(errors)-10}" if len(errors) > 10 else ""
@@ -791,8 +770,6 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 # === КОНЕЦ БЛОКА /expenses ===
-
-
 
 
 @router.message(Command("return"))
@@ -807,10 +784,15 @@ async def return_receipt(message: Message, state: FSMContext):
     await state.set_state(ReturnReceipt.ENTER_FISCAL_DOC)
     logger.info(f"Запрос фискального номера для /return: user_id={message.from_user.id}")
 
+
 @router.message(ReturnReceipt.ENTER_FISCAL_DOC)
 async def process_fiscal_doc(message: Message, state: FSMContext):
-    fiscal_doc = message.text.strip()
+    if not message.text:
+        await message.answer("Пожалуйста, введите фискальный номер текстом.", reply_markup=reset_keyboard())
+        logger.warning(f"Получен update без текста для /return: user_id={message.from_user.id}")
+        return
 
+    fiscal_doc = message.text.strip()
     if not fiscal_doc.isdigit() or len(fiscal_doc) > 20:
         await message.answer("Фискальный номер должен содержать только цифры и быть не длиннее 20 символов.", reply_markup=reset_keyboard())
         logger.info(f"Некорректный фискальный номер для /return: {fiscal_doc}, user_id={message.from_user.id}")
@@ -818,19 +800,23 @@ async def process_fiscal_doc(message: Message, state: FSMContext):
 
     try:
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_NAME, range="Чеки!A:M"
+            spreadsheetId=SHEET_NAME, range="Чеки!A:P"
         ).execute()
-        receipts = [row for row in result.get("values", [])[1:] if len(row) > 10 and row[10] == fiscal_doc and row[6] != "Возвращен"]
+        receipts = [
+            row for row in result.get("values", [])[1:]
+            if len(row) > 12 and row[12] == fiscal_doc and row[8] != "Возвращен"  # M=fiscal_doc, I=статус
+        ]
         if not receipts:
             await message.answer("Чеки не найдены или уже возвращены.", reply_markup=reset_keyboard())
             logger.info(f"Чеки не найдены для /return: fiscal_doc={fiscal_doc}, user_id={message.from_user.id}")
             return
-        item_map = {}
-        for i, row in enumerate(receipts):
-            item_map[i] = row[8] if len(row) > 8 else "Неизвестно"
+
+        # Сохраняем карту товаров
+        item_map = {i: (row[10] if len(row) > 10 else "Неизвестно") for i, row in enumerate(receipts)}  # K=товар
         await state.update_data(fiscal_doc=fiscal_doc, item_map=item_map)
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=row[8] if len(row) > 8 else "Неизвестно", callback_data=f"товар_{fiscal_doc}_{i}")]
+            [InlineKeyboardButton(text=row[10] if len(row) > 10 else "Неизвестно", callback_data=f"товар_{fiscal_doc}_{i}")]
             for i, row in enumerate(receipts)
         ])
         await message.answer("Выберите товар для возврата:", reply_markup=keyboard)
@@ -842,6 +828,8 @@ async def process_fiscal_doc(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.", reply_markup=reset_keyboard())
         logger.error(f"Неожиданная ошибка /return: {str(e)}, user_id={message.from_user.id}")
+
+
 
 # (Дополнительные обработчики, такие как SELECT_ITEM, можно оставить без изменений, если они уже определены)
 
@@ -944,8 +932,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    fiscal_doc = data.get("fiscal_doc")
-    new_fiscal_doc = data.get("new_fiscal_doc")
+    fiscal_doc = data.get("fiscal_doc")          # исходный fiscal_doc
+    new_fiscal_doc = data.get("new_fiscal_doc")  # новый из QR возврата
     item_name = data.get("item_name")
     parsed_data = data.get("parsed_data")
 
@@ -958,11 +946,11 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
 
             row_updated = False
             for i, row in enumerate(rows, start=2):
-                if len(row) > 12 and row[12] == fiscal_doc and row[10] == item_name:
+                if len(row) > 12 and row[12] == fiscal_doc and row[10] == item_name:  # M=fiscal_doc, K=товар
                     while len(row) < 16:
                         row.append("")
-                    row[8] = "Возвращен"          # I: статус
-                    row[14] = parsed_data["qr_string"]  # O: QR возврата
+                    row[8] = "Возвращен"                 # I: статус
+                    row[14] = parsed_data["qr_string"]   # O: QR возврата
                     sheets_service.spreadsheets().values().update(
                         spreadsheetId=SHEET_NAME,
                         range=f"Чеки!A{i}:P{i}",
@@ -971,7 +959,7 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                     ).execute()
                     row_updated = True
 
-                    total_sum = float(row[2]) if row[2] else 0.0
+                    total_sum = float(row[2]) if row[2] else 0.0  # C: сумма
                     await save_receipt_summary(parsed_data["date"], "Возврат", total_sum, f"{new_fiscal_doc} - {item_name}")
 
                     await callback.message.edit_text(
