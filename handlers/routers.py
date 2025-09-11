@@ -9,8 +9,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
 from sheets import sheets_service, is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, save_receipt_summary
-from utils import parse_qr_from_photo, confirm_manual_api
-from handlers.notifications import send_group_notification, safe_float, send_user_notification
+from utils import parse_qr_from_photo, confirm_manual_api, safe_float
+from handlers.notifications import send_group_notification, send_user_notification
 from googleapiclient.errors import HttpError
 import logging
 from datetime import datetime
@@ -26,6 +26,7 @@ class AddReceiptQR(StatesGroup):
     SELECT_TYPE = State()
     CONFIRM_DELIVERY_DATE = State()  # ввод даты для текущего товара
     WAIT_LINK = State()              # ввод ссылки для текущего товара
+    WAIT_COMMENT = State()
     CONFIRM_ACTION = State()
 
 class ConfirmDelivery(StatesGroup):
@@ -210,72 +211,83 @@ async def process_receipt_type(callback: CallbackQuery, state: FSMContext):
     parsed_data = data.get("parsed_data", {})
     items = parsed_data.get("items", [])
 
-    total_sum = sum(float(item.get("sum", 0)) for item in items)
+    if not items:
+        await callback.message.answer("⚠️ Нет товаров в чеке. Попробуйте снова или используйте /add_manual.", reply_markup=reset_keyboard())
+        await state.clear()
+        logger.error(f"Нет товаров в чеке: fiscal_doc={parsed_data.get('fiscal_doc', '')}, user_id={callback.from_user.id}")
+        return
+
+    total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
     items_list = "\n".join([
         f"- {item.get('name', '—')} "
-        f"(Сумма: {float(item.get('sum', 0)):.2f} RUB, "
-        f"Цена: {float(item.get('price', 0)):.2f} RUB, "
+        f"(Сумма: {safe_float(item.get('sum', 0)):.2f} RUB, "
+        f"Цена: {safe_float(item.get('price', 0)):.2f} RUB, "
         f"Кол-во: {item.get('quantity', 1)})"
         for item in items
     ])
 
     if callback.data == "type_store":
         receipt_type = "Полный"
-        receipt = {
-            "date": parsed_data.get("date"),
-            "store": parsed_data.get("store", "Неизвестно"),
-            "items": [
-                {
-                    "name": item.get("name", "—"),
-                    "sum": item.get("sum", 0),
-                    "price": item.get("price", 0),
-                    "quantity": item.get("quantity", 1)
-                }
-                for item in items
-            ],
-            "receipt_type": receipt_type,
-            "fiscal_doc": parsed_data.get("fiscal_doc", ""),
-            "qr_string": parsed_data.get("qr_string", ""),
-            "delivery_date": "",
-            "status": "Доставлено",
-            "customer": data.get("customer", "Неизвестно")
-        }
-        details = (
-            f"Детали чека:\n"
-            f"Магазин: {receipt['store']}\n"
-            f"Заказчик: {receipt['customer']}\n"
-            f"Сумма: {total_sum:.2f} RUB\n"
-            f"Товары:\n{items_list}\n"
-            f"Фискальный номер: {receipt['fiscal_doc']}"
-        )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
-            [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
-        ])
-        await callback.message.answer(details, reply_markup=keyboard)
-        await state.update_data(receipt=receipt)
-        await state.set_state(AddReceiptQR.CONFIRM_ACTION)
+        await state.update_data(receipt_type=receipt_type, delivery_dates=[], links=[], comments=[])
+        if items:
+            await callback.message.answer(
+                f"💬 Введите комментарий для «{items[0].get('name', '—')}» или /skip:",
+                reply_markup=reset_keyboard()
+            )
+            await state.update_data(current_item_index=0)
+            await state.set_state(AddReceiptQR.WAIT_COMMENT)
+        else:
+            receipt = {
+                "date": parsed_data.get("date"),
+                "store": parsed_data.get("store", "Неизвестно"),
+                # В блоке else (если items пустые, но для полноты)
+                "items": [
+                    {
+                        "name": item.get("name", "—"),
+                        "sum": safe_float(item.get("sum", 0)),
+                        "price": safe_float(item.get("price", 0)),
+                        "quantity": item.get("quantity", 1),
+                        "link": "",  # Для store links=[] , так что ""
+                        "comment": ""  # Аналогично
+                    }
+                    for item in items
+                ],
+                "receipt_type": receipt_type,
+                "fiscal_doc": parsed_data.get("fiscal_doc", ""),
+                "qr_string": parsed_data.get("qr_string", ""),
+                "delivery_dates": [],
+                "links": [],
+                "comments": [],
+                "status": "Доставлено",
+                "customer": data.get("customer", "Неизвестно")
+            }
+            details = (
+                f"Детали чека:\n"
+                f"Магазин: {receipt['store']}\n"
+                f"Заказчик: {receipt['customer']}\n"
+                f"Сумма: {total_sum:.2f} RUB\n"
+                f"Товары:\n{items_list}\n"
+                f"Фискальный номер: {receipt['fiscal_doc']}"
+            )
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
+                [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
+            ])
+            await callback.message.answer(details, reply_markup=keyboard)
+            await state.update_data(receipt=receipt)
+            await state.set_state(AddReceiptQR.CONFIRM_ACTION)
 
     elif callback.data == "type_delivery":
         receipt_type = "Предоплата"
-        await state.update_data(receipt_type=receipt_type)
-        if len(items) == 1:
-            await callback.message.answer(
-                f"Введите дату доставки для {items[0].get('name', '—')} "
-                f"(ддммгг, например 110825) или /skip.",
-                reply_markup=reset_keyboard()
-            )
-            await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
-        else:
-            await state.update_data(current_item_index=0, delivery_dates=[])
-            await callback.message.answer(
-                f"Введите дату доставки для {items[0].get('name', '—')} "
-                f"(ддммгг, например 110825) или /skip.",
-                reply_markup=reset_keyboard()
-            )
-            await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
-
-
+        await state.update_data(receipt_type=receipt_type, delivery_dates=[], links=[], comments=[])
+        await state.update_data(current_item_index=0)
+        await callback.message.answer(
+            f"📅 Введите дату доставки для «{items[0].get('name', '—')}» "
+            f"(ддммгг, например 110825) или /skip:",
+            reply_markup=reset_keyboard()
+        )
+        await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
+        logger.info(f"Выбрана доставка: fiscal_doc={parsed_data.get('fiscal_doc', '')}, user_id={callback.from_user.id}")
 
 @router.message(AddReceiptQR.CONFIRM_DELIVERY_DATE)
 async def process_delivery_date(message: Message, state: FSMContext):
@@ -336,9 +348,9 @@ async def process_delivery_date(message: Message, state: FSMContext):
 async def process_receipt_link(message: Message, state: FSMContext):
     link = (message.text or "").strip()
 
-    if not (link.startswith("http://") or link.startswith("https://")):
+    if link != "/skip" and not (link.startswith("http://") or link.startswith("https://")):
         await message.answer(
-            "⚠️ Пожалуйста, отправьте корректную ссылку (http/https).",
+            "⚠️ Пожалуйста, отправьте корректную ссылку (http/https) или /skip.",
             reply_markup=reset_keyboard()
         )
         return
@@ -346,12 +358,11 @@ async def process_receipt_link(message: Message, state: FSMContext):
     data = await state.get_data()
     parsed_data = data.get("parsed_data", {})
     items = parsed_data.get("items", [])
-    receipt_type = data.get("receipt_type", "Покупка")
-
     current_item_index = data.get("current_item_index", 0)
-    delivery_dates = data.get("delivery_dates", [])
     links = data.get("links", [])
 
+    # Сохраняем ссылку
+    link = "" if link == "/skip" else link
     while len(links) < current_item_index:
         links.append("")
     if len(links) == current_item_index:
@@ -361,31 +372,75 @@ async def process_receipt_link(message: Message, state: FSMContext):
 
     await state.update_data(links=links)
 
-    # если есть следующий товар
+    # Переходим к вводу комментария
+    item_name = items[current_item_index]['name']
+    await message.answer(
+        f"💬 Введите комментарий для «{item_name}» или /skip:",
+        reply_markup=reset_keyboard()
+    )
+    await state.set_state(AddReceiptQR.WAIT_COMMENT)
+
+@router.message(AddReceiptQR.WAIT_COMMENT)
+async def process_receipt_comment(message: Message, state: FSMContext):
+    comment = (message.text or "").strip()
+    if comment == "/skip":
+        comment = ""
+
+    data = await state.get_data()
+    parsed_data = data.get("parsed_data", {})
+    items = parsed_data.get("items", [])
+    receipt_type = data.get("receipt_type", "Покупка")
+    current_item_index = data.get("current_item_index", 0)
+    comments = data.get("comments", [])
+
+    # Сохраняем комментарий
+    while len(comments) < current_item_index:
+        comments.append("")
+    if len(comments) == current_item_index:
+        comments.append(comment)
+    else:
+        comments[current_item_index] = comment
+
+    await state.update_data(comments=comments)
+
+    # Если есть следующий товар
     if current_item_index + 1 < len(items):
         next_index = current_item_index + 1
         await state.update_data(current_item_index=next_index)
-        await message.answer(
-            f"Введите дату доставки для {items[next_index].get('name', '—')} "
-            f"(ддммгг, например 110825) или /skip:",
-            reply_markup=reset_keyboard()
-        )
-        await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
+        if receipt_type == "Полный":
+            await message.answer(
+                f"💬 Введите комментарий для «{items[next_index].get('name', '—')}» или /skip:",
+                reply_markup=reset_keyboard()
+            )
+            await state.set_state(AddReceiptQR.WAIT_COMMENT)
+        else:
+            await message.answer(
+                f"📅 Введите дату доставки для «{items[next_index].get('name', '—')}» "
+                f"(ддммгг, например 110825) или /skip:",
+                reply_markup=reset_keyboard()
+            )
+            await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         return
 
-    # все товары пройдены
-    total_sum = sum(float(item.get("sum", 0)) for item in items)
+    # Все товары обработаны
+    total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
+    delivery_dates = data.get("delivery_dates", [])
+    links = data.get("links", [])
+    comments = data.get("comments", [])
+
     rows = []
     for i, item in enumerate(items):
         d = delivery_dates[i] if i < len(delivery_dates) else ""
         l = links[i] if i < len(links) else ""
+        c = comments[i] if i < len(comments) else ""
         rows.append(
             f"- {item.get('name', '—')} "
-            f"(Сумма: {float(item.get('sum', 0)):.2f} RUB, "
-            f"Цена: {float(item.get('price', 0)):.2f} RUB, "
+            f"(Сумма: {safe_float(item.get('sum', 0)):.2f} RUB, "
+            f"Цена: {safe_float(item.get('price', 0)):.2f} RUB, "
             f"Кол-во: {item.get('quantity', 1)}, "
             f"Доставка: {d or '—'}, "
-            f"Ссылка: {l or '—'})"
+            f"Ссылка: {l or '—'}, "
+            f"Комментарий: {c or '—'})"
         )
 
     receipt = {
@@ -394,18 +449,21 @@ async def process_receipt_link(message: Message, state: FSMContext):
         "items": [
             {
                 "name": item.get("name", "—"),
-                "sum": item.get("sum", 0),
-                "price": item.get("price", 0),
-                "quantity": item.get("quantity", 1)
+                "sum": safe_float(item.get("sum", 0)),
+                "price": safe_float(item.get("price", 0)),
+                "quantity": item.get("quantity", 1),
+                "link": links[i] if i < len(links) else "",
+                "comment": comments[i] if i < len(comments) else ""
             }
-            for item in items
+            for i, item in enumerate(items)  # ИСПРАВЛЕНИЕ: добавлен enumerate для правильного i
         ],
         "receipt_type": receipt_type,
         "fiscal_doc": parsed_data.get("fiscal_doc", ""),
         "qr_string": parsed_data.get("qr_string", ""),
         "delivery_dates": delivery_dates,
         "links": links,
-        "status": "Ожидает",
+        "comments": comments,
+        "status": "Ожидает" if receipt_type == "Предоплата" else "Доставлено",
         "customer": data.get("customer", "Неизвестно")
     }
 
@@ -427,16 +485,14 @@ async def process_receipt_link(message: Message, state: FSMContext):
     await state.update_data(receipt=receipt)
     await state.set_state(AddReceiptQR.CONFIRM_ACTION)
 
-
-
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "confirm_add")
 async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     loading_message = await callback.message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
 
     data = await state.get_data()
-    receipt = data.get("receipt", {})
-    parsed_data = data.get("parsed_data", {})
+    receipt: dict = data.get("receipt", {})
+    parsed_data: dict = data.get("parsed_data", {})
     user_name = await is_user_allowed(callback.from_user.id)
 
     if not user_name:
@@ -444,37 +500,57 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    # Просто один вызов save_receipt для всего чека
+    # Логируем товары до сохранения
+    logger.info(
+        f"Перед сохранением чека: fiscal_doc={parsed_data.get('fiscal_doc', '')}, "
+        f"items={receipt.get('items', [])}, user_id={callback.from_user.id}"
+    )
+
     saved = await save_receipt(receipt, user_name=user_name)
 
     if saved:
         balance_data = await get_monthly_balance()
         balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
-        delivery_date = receipt.get("delivery_dates", "Не указана")
-        if isinstance(delivery_date, list):
-            delivery_date = delivery_date[0] if delivery_date else "Не указана"
 
+        # ИСПРАВЛЕНИЕ: Получаем delivery_dates из receipt
+        delivery_dates = receipt.get("delivery_dates", [])
+        # Для заголовка: первая дата или "Не указана"
+        delivery_date_header = delivery_dates[0] if delivery_dates else "Не указана"
+
+        # ИСПРАВЛЕНИЕ: Нормализуем товары с per-item данными, включая delivery_date
+        items = []
+        for i, item in enumerate(receipt.get("items", [])):
+            deliv_date = delivery_dates[i] if i < len(delivery_dates) else ""
+            items.append({
+                "name": item.get("name", "—"),
+                "sum": safe_float(item.get("sum", 0)),
+                "price": safe_float(item.get("price", 0)),
+                "quantity": int(item.get("quantity", 1) or 1),
+                "link": item.get("link", ""),
+                "comment": item.get("comment", ""),
+                "delivery_date": deliv_date  # Per-item дата
+            })
+
+        # Отправляем уведомления
         await send_group_notification(
             bot=callback.bot,
             action="🆕 Добавлен чек",
-            items=receipt.get("items", []),
+            items=items,
             user_name=user_name,
             fiscal_doc=parsed_data.get("fiscal_doc", ""),
-            delivery_date=delivery_date,
-            balance=balance,
-            links=receipt.get("links", [])
+            delivery_date=delivery_date_header,
+            balance=balance
         )
 
         await send_user_notification(
             bot=callback.bot,
             chat_id=callback.message.chat.id,
             action="🆕 Чек добавлен",
-            items=receipt.get("items", []),
+            items=items,
             user_name=user_name,
             fiscal_doc=parsed_data.get("fiscal_doc", ""),
-            delivery_date=delivery_date,
-            balance=balance,
-            links=receipt.get("links", [])
+            delivery_date=delivery_date_header,
+            balance=balance
         )
 
         await loading_message.delete()
@@ -485,9 +561,11 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext):
 
     logger.info(
         f"Чек подтвержден: fiscal_doc={parsed_data.get('fiscal_doc', '')}, "
-        f"positions={len(receipt.get('items', []))}, balance={balance}, user_id={callback.from_user.id}, user_name={user_name}"
+        f"positions={len(receipt.get('items', []))}, balance={balance}, "
+        f"user_id={callback.from_user.id}, user_name={user_name}"
     )
     await state.clear()
+
 
 @router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "cancel_add")
 async def cancel_add_action(callback, state: FSMContext):
@@ -744,16 +822,16 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
     qr_str = parsed.get("qr_string", "")
 
     ok, fail, errors = 0, 0, []
-    links = []
+    updated_items = []  # ИСПРАВЛЕНИЕ: Инициализируем список
 
     for it in sel_items:
         row_index = it["row_index"]
         try:
             res = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SHEET_NAME, range=f"Чеки!A{row_index}:P{row_index}"
+                spreadsheetId=SHEET_NAME, range=f"Чеки!A{row_index}:Q{row_index}"
             ).execute()
             row = res.get("values", [[]])[0] if res.get("values") else []
-            while len(row) < 16:
+            while len(row) < 17:
                 row.append("")
 
             row[8] = "Доставлено"  # I: статус
@@ -761,19 +839,28 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             row[12] = str(new_fd)  # M: fiscal_doc
             row[13] = qr_str       # N: QR строка
 
-            # Извлекаем ссылку из столбца P
             link = row[15].strip() if len(row) > 15 and row[15] else ""
-            if link:
-                links.append(link)
+            comment = row[16].strip() if len(row) > 16 and row[16] else ""
+            delivery_date = row[7].strip() if row[7] else ""  # H: Дата доставки (per-item)
 
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SHEET_NAME,
-                range=f"Чеки!A{row_index}:P{row_index}",
+                range=f"Чеки!A{row_index}:Q{row_index}",
                 valueInputOption="RAW",
                 body={"values": [row]}
             ).execute()
 
-            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}, link={link}")
+            # ИСПРАВЛЕНИЕ: Добавляем per-item данные, включая delivery_date
+            updated_items.append({
+                "name": it.get("name", "—"),
+                "sum": safe_float(it.get("sum", 0)),
+                "quantity": int(it.get("quantity", 1)),
+                "link": link,
+                "comment": comment,
+                "delivery_date": delivery_date
+            })
+
+            logger.info(f"Обновлена строка в Чеки: row={row_index}, fiscal_doc={new_fd}, link={link}, comment={comment}, delivery_date={delivery_date}")
             ok += 1
         except HttpError as e:
             fail += 1
@@ -791,28 +878,29 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
 
     user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
 
+    # ИСПРАВЛЕНИЕ: Для заголовка delivery_date — первая из updated_items или текущая дата
+    delivery_date_header = updated_items[0].get("delivery_date", datetime.now().strftime("%d.%m.%Y")) if updated_items else datetime.now().strftime("%d.%m.%Y")
+
     if fail == 0:
         await send_group_notification(
             bot=callback.bot,
             action="📦 Подтверждена доставка",
-            items=sel_items,
+            items=updated_items,
             user_name=user_name,
             fiscal_doc=new_fd,
-            delivery_date=datetime.now().strftime("%d.%m.%Y"),
-            balance=balance,
-            links=links
+            delivery_date=delivery_date_header,
+            balance=balance
         )
 
         await send_user_notification(
             bot=callback.bot,
             chat_id=callback.message.chat.id,
             action="📦 Доставка подтверждена",
-            items=sel_items,
+            items=updated_items,
             user_name=user_name,
             fiscal_doc=new_fd,
-            delivery_date=datetime.now().strftime("%d.%m.%Y"),
-            balance=balance,
-            links=links
+            delivery_date=delivery_date_header,
+            balance=balance
         )
     else:
         details = "\n".join(errors[:10])
@@ -821,7 +909,7 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext):
             f"⚠️ Частично: успешно {ok}, ошибок {fail}.\n{details}{more}\n🟰 Остаток: {balance:.2f} RUB"
         )
 
-    logger.info(f"Доставка подтверждена: fiscal_doc={new_fd}, ok={ok}, fail={fail}, user_id={callback.from_user.id}, links={links}")
+    logger.info(f"Доставка подтверждена: fiscal_doc={new_fd}, ok={ok}, fail={fail}, user_id={callback.from_user.id}")
     await state.clear()
     await callback.answer()
 # === КОНЕЦ БЛОКА /expenses ===
@@ -987,8 +1075,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
 @router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    fiscal_doc = data.get("fiscal_doc")          # исходный fiscal_doc
-    new_fiscal_doc = data.get("new_fiscal_doc")  # новый из QR возврата
+    fiscal_doc = data.get("fiscal_doc")
+    new_fiscal_doc = data.get("new_fiscal_doc")
     item_name = data.get("item_name")
     parsed_data = data.get("parsed_data")
     user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
@@ -996,36 +1084,32 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
     if callback.data == "confirm_return":
         try:
             result = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SHEET_NAME, range="Чеки!A:P"
+                spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
             ).execute()
             rows = result.get("values", [])[1:]
 
             row_updated = False
             for i, row in enumerate(rows, start=2):
-                if len(row) > 12 and row[12] == fiscal_doc and row[10] == item_name:  # M=fiscal_doc, K=товар
-                    while len(row) < 16:
+                if len(row) > 12 and row[12] == fiscal_doc and row[10] == item_name:
+                    while len(row) < 17:
                         row.append("")
-                    row[8] = "Возвращен"                 # I: статус
-                    row[14] = parsed_data["qr_string"]   # O: QR возврата
+                    row[8] = "Возвращен"
+                    row[14] = parsed_data["qr_string"]
+                    link = row[15].strip() if len(row) > 15 and row[15] else ""
+                    comment = row[16].strip() if len(row) > 16 and row[16] else ""
+                    delivery_date = row[7].strip() if row[7] else ""
+
                     sheets_service.spreadsheets().values().update(
                         spreadsheetId=SHEET_NAME,
-                        range=f"Чеки!A{i}:P{i}",
+                        range=f"Чеки!A{i}:Q{i}",
                         valueInputOption="RAW",
                         body={"values": [row]}
                     ).execute()
                     row_updated = True
 
-                    total_sum = safe_float(row[2]) if row[2] else 0.0  # C: сумма
-                    try:
-                        balance_data = await get_monthly_balance()
-                        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
-                    except Exception as e:
-                        logger.error(f"Ошибка получения баланса: {str(e)}")
-                        balance = 0.0
+                    total_sum = safe_float(row[2]) if row[2] else 0.0
 
-                    items = [{"name": item_name, "sum": total_sum, "quantity": 1}]
-                    links = [row[15]] if len(row) > 15 and row[15] else []
-
+                    # ИСПРАВЛЕНИЕ: Сначала сохраняем возврат в "Сводка"
                     await save_receipt_summary(
                         parsed_data["date"],
                         "Возврат",
@@ -1033,15 +1117,33 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                         f"{new_fiscal_doc} - {item_name}"
                     )
 
+                    # ИСПРАВЛЕНИЕ: Затем получаем обновлённый баланс
+                    try:
+                        balance_data = await get_monthly_balance()
+                        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+                    except Exception as e:
+                        logger.error(f"Ошибка получения баланса: {str(e)}")
+                        balance = 0.0
+
+                    items = [{
+                        "name": item_name,
+                        "sum": total_sum,
+                        "quantity": 1,
+                        "link": link,
+                        "comment": comment,
+                        "delivery_date": delivery_date
+                    }]
+
+                    delivery_date_header = delivery_date or datetime.now().strftime("%d.%m.%Y")
+
                     await send_group_notification(
                         bot=callback.bot,
                         action="↩️ Возврат товара",
                         items=items,
                         user_name=user_name,
                         fiscal_doc=new_fiscal_doc,
-                        delivery_date=datetime.now().strftime("%d.%m.%Y"),
-                        balance=balance,
-                        links=links
+                        delivery_date=delivery_date_header,
+                        balance=balance  # Передаём обновлённый баланс
                     )
 
                     await send_user_notification(
@@ -1051,9 +1153,8 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                         items=items,
                         user_name=user_name,
                         fiscal_doc=new_fiscal_doc,
-                        delivery_date=datetime.now().strftime("%d.%m.%Y"),
-                        balance=balance,
-                        links=links
+                        delivery_date=delivery_date_header,
+                        balance=balance  # Передаём обновлённый баланс
                     )
 
                     break

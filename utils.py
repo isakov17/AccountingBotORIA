@@ -190,3 +190,17 @@ OP_TYPE_MAPPING = {
     "расход": 3,
     "возврат расхода": 4
 }
+
+def safe_float(value: str | float | int, default: float = 0.0) -> float:
+    """
+    Безопасное преобразование строки/числа в float
+    Заменяет запятые на точки, отсекает пробелы
+    """
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            return float(value.replace(",", ".").strip())
+    except Exception:
+        return default
+    return default

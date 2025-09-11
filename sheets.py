@@ -4,7 +4,7 @@ import logging
 from config import SHEET_NAME, GOOGLE_CREDENTIALS
 from datetime import datetime  # Импорт datetime
 from googleapiclient.errors import HttpError
-from utils import redis_client, cache_get, cache_set
+from utils import redis_client, cache_get, cache_set, safe_float
 
 
 logger = logging.getLogger("AccountingBot")
@@ -97,7 +97,8 @@ async def save_receipt(
         status = data.get("status", "Доставлено" if receipt_type in ("Покупка", "Полный") else "Ожидает")
         customer = data.get("customer", customer or "Неизвестно")
         delivery_dates = data.get("delivery_dates", [])
-        links = data.get("links", [])
+        links = data.get("links", []) or []
+        comments = data.get("comments", []) or []
         type_for_sheet = data.get("receipt_type", receipt_type)
 
         def _normalize_date(s: str) -> str:
@@ -114,43 +115,50 @@ async def save_receipt(
         date_for_sheet = _normalize_date(raw_date)
         added_at = datetime.now().strftime("%d.%m.%Y")
 
-        # === собираем все строки ===
+        # Собираем все строки
         rows_checks = []
         rows_summary = []
 
-        for i, item in enumerate(data.get("items", [])):
-            item_name = item.get("name", "Неизвестно")
-            item_sum = float(item.get("sum", 0))
-            item_qty = float(item.get("quantity", 1)) or 1
-            item_price = float(item.get("price", 0)) or (item_sum / item_qty)
+        items = data.get("items", [])
 
-            # Чеки
+        for i, item in enumerate(items):
+            item_name = item.get("name", "Неизвестно")
+            item_sum = safe_float(item.get("sum", 0))
+            item_qty = float(item.get("quantity", 1)) or 1
+            item_price = safe_float(item.get("price", 0)) or (item_sum / item_qty)
+
+            item_link = (links[i] if i < len(links) else "") or item.get("link", "")
+            item_comment = (comments[i] if i < len(comments) else "") or item.get("comment", "")
+
+            logger.info(f"save_receipt: item[{i}] name={item_name!r} link={item_link!r} (from links[{i}] or item) comment={item_comment!r} (from comments[{i}] or item)")
+            # Чеки (A:Q)
             row = [
-                added_at,                     # A Дата добавления
-                date_for_sheet,               # B Дата покупки
-                item_sum,                     # C Сумма
-                item_price,                   # D Цена за ед.
-                item_qty,                     # E Кол-во
-                user_name,                    # F Пользователь
-                store,                        # G Магазин
+                added_at,  # A Дата добавления
+                date_for_sheet,  # B Дата покупки
+                item_sum,  # C Сумма
+                item_price,  # D Цена за ед.
+                item_qty,  # E Кол-во
+                user_name,  # F Пользователь
+                store,  # G Магазин
                 delivery_dates[i] if i < len(delivery_dates) else "",  # H Дата доставки
-                status,                       # I Статус
-                customer,                     # J Заказчик
-                item_name,                    # K Товар
-                type_for_sheet,               # L Тип чека
-                str(fiscal_doc),              # M Фискальный номер
-                qr_string,                    # N QR
-                "",                           # O QR возврата
-                links[i] if i < len(links) else ""  # P Ссылка
+                status,  # I Статус
+                customer,  # J Заказчик
+                item_name,  # K Товар
+                type_for_sheet,  # L Тип чека
+                str(fiscal_doc),  # M Фискальный номер
+                qr_string,  # N QR
+                "",  # O QR возврата
+                item_link,  # P Ссылка
+                item_comment  # Q Комментарий
             ]
             rows_checks.append(row)
 
-            # Сводка (расход всегда отрицательный)
+            # Сводка (расход всегда положительный в колонке расход)
             rows_summary.append([
                 date_for_sheet,
                 "Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                "",                       # Доход
-                abs(item_sum),            # Расход
+                "",  # Доход
+                abs(item_sum),  # Расход
                 f"{fiscal_doc} - {item_name}"  # Комментарий
             ])
 
@@ -164,16 +172,16 @@ async def save_receipt(
                 f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
             ])
 
-        # === один запрос в Чеки ===
+        # Один запрос в Чеки
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SHEET_NAME,
-            range="Чеки!A:P",
+            range="Чеки!A:Q",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": rows_checks},
         ).execute()
 
-        # === один запрос в Сводку ===
+        # Один запрос в Сводку
         if rows_summary:
             sheets_service.spreadsheets().values().append(
                 spreadsheetId=SHEET_NAME,
@@ -189,9 +197,6 @@ async def save_receipt(
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения чека: {e}, user={user_name}")
         return False
-
-
-
 
 
 async def save_receipt_summary(date, operation_type, sum_value, note):
