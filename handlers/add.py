@@ -3,7 +3,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, update_fiscal_cache, async_sheets_call, sheets_service  # Полные imports
+from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, async_sheets_call, sheets_service  # Полные imports
 from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
@@ -136,7 +136,7 @@ async def start_add_receipt(message: Message, state: FSMContext) -> None:
         logger.info(f"Доступ запрещен для /add: user_id={message.from_user.id}")
         return
     await state.update_data(username=message.from_user.username or str(message.from_user.id))
-    await message.answer("Отправьте фото QR-кода чека.")
+    await message.answer("Отправьте фото QR-кода чека.", reply_markup=reset_keyboard())
     await state.set_state(AddReceiptQR.UPLOAD_QR)
     logger.info(f"Начало добавления чека по QR: user_id={message.from_user.id}")
 
@@ -454,7 +454,6 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
     saved = await save_receipt(receipt, user_name=user_name)
 
     if saved:
-        await update_fiscal_cache(parsed_data.get("fiscal_doc", ""))
         balance_data = await get_monthly_balance()
         balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
 

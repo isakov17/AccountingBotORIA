@@ -16,10 +16,6 @@ creds = service_account.Credentials.from_service_account_info(
 sheets_service = build('sheets', 'v4', credentials=creds)
 
 async def async_sheets_call(method_callable, *args, **kwargs):
-    """
-    Async wrapper для Google API calls.
-    Фикс: Вызывает .execute() внутри executor.
-    """
     loop = asyncio.get_event_loop()
     def make_call():
         request = method_callable(*args, **kwargs)
@@ -35,7 +31,7 @@ async def is_user_allowed(user_id: int) -> str | None:
     cache_key = f"user_allowed:{user_id}"
     cached = await cache_get(cache_key)
     if cached is not None:
-        logger.info(f"Cache hit for user_id={user_id}")
+        logger.debug(f"Cache hit for user_id={user_id}")
         return cached
 
     list_key = "allowed_users_list"
@@ -61,35 +57,37 @@ async def is_user_allowed(user_id: int) -> str | None:
             return user_name
 
     await cache_set(cache_key, None, expire=86400)
-    logger.info(f"User not allowed: user_id={user_id}")
+    logger.debug(f"User not allowed: user_id={user_id}")
     return None
 
-fiscal_cache_key = "fiscal_docs_set"
-fiscal_cache_expire = 300
-
 async def is_fiscal_doc_unique(fiscal_doc: str) -> bool:
-    cached_docs = await cache_get(fiscal_cache_key)
-    if cached_docs is None:
-        try:
-            result = await async_sheets_call(
-                sheets_service.spreadsheets().values().get,
-                spreadsheetId=SHEET_NAME, range="Чеки!M:M"
-            )
-            cached_docs = {str(row[0]).strip() for row in result.get("values", []) if row and row[0]}
-            await cache_set(fiscal_cache_key, list(cached_docs), expire=fiscal_cache_expire)
-            logger.info(f"Fiscal docs cache updated: {len(cached_docs)} docs")
-        except Exception as e:
-            logger.error(f"Error caching fiscal docs: {str(e)}")
-            cached_docs = set()
+    try:
+        result = await async_sheets_call(
+            sheets_service.spreadsheets().values().get,
+            spreadsheetId=SHEET_NAME, range="Чеки!M:M"
+        )
+        raw_values = result.get("values", [])
+        logger.debug(f"Direct fetch Чеки!M:M: total rows={len(raw_values)}")  # Minimal: no raw
 
-    is_unique = str(fiscal_doc).strip() not in cached_docs
-    logger.info(f"Unique check fiscal_doc {fiscal_doc}: {'unique' if is_unique else 'exists'}")
-    return is_unique
+        existing_docs = {
+            str(row[0]).strip() 
+            for row in raw_values 
+            if row and row[0] and str(row[0]).strip().isdigit()
+        }
+        if existing_docs:
+            logger.debug(f"Filtered fiscal docs: {len(existing_docs)} unique")  # Quiet, no sample
+        else:
+            logger.debug(f"Filtered fiscal docs: 0 unique")
 
-async def update_fiscal_cache(new_doc: str):
-    docs = set(await cache_get(fiscal_cache_key) or [])
-    docs.add(new_doc)
-    await cache_set(fiscal_cache_key, list(docs), expire=fiscal_cache_expire)
+        is_unique = str(fiscal_doc).strip() not in existing_docs
+        status = 'unique ✅' if is_unique else 'exists ❌'
+        logger.info(f"is_fiscal_doc_unique '{fiscal_doc}': {status}")
+        return is_unique
+
+    except Exception as e:
+        logger.error(f"Error fetching fiscal docs M:M: {str(e)}")
+        logger.warning(f"Fallback: assume unique for '{fiscal_doc}' due to error")
+        return True
 
 async def save_receipt(
     data_or_parsed=None,
@@ -124,27 +122,26 @@ async def save_receipt(
         added_at = datetime.now().strftime("%d.%m.%Y")
 
         rows_checks = []
-        rows_summary = []
+        rows_summary = []  # Keep for data append (formulas sum C/D)
 
         items = data.get("items", [])
-
         for i, item in enumerate(items):
             item_name = item.get("name", "Неизвестно")
-            item_sum = safe_float(item.get("sum", 0))
-            item_qty = float(item.get("quantity", 1)) or 1
-            item_price = safe_float(item.get("price", 0)) or (item_sum / item_qty if item_qty else 0)
+            item_sum = float(safe_float(item.get("sum", 0)))  # FIX: Pure float for summable
+            item_qty = float(item.get("quantity", 1)) or 1.0
+            item_price = float(safe_float(item.get("price", 0))) or (item_sum / item_qty if item_qty else 0.0)
 
             item_link = (links[i] if i < len(links) else "") or item.get("link", "")
             item_comment = (comments[i] if i < len(comments) else "") or item.get("comment", "")
 
-            logger.info(f"save_receipt: item[{i}] name={item_name!r} link={item_link!r} comment={item_comment!r}")
-            
+            logger.debug(f"save_receipt: item[{i}] name={item_name}, sum={item_sum}")  # Minimal: no !r, debug
+
             row = [
                 added_at,  # A
                 date_for_sheet,  # B
-                item_sum,  # C
-                item_price,  # D
-                item_qty,  # E
+                item_sum,  # C: float (number)
+                item_price,  # D: float
+                item_qty,  # E: float
                 user_name,  # F
                 store,  # G
                 delivery_dates[i] if i < len(delivery_dates) else "",  # H
@@ -160,23 +157,26 @@ async def save_receipt(
             ]
             rows_checks.append(row)
 
+            # Summary data row (for formulas sum C/D; no fixed)
             rows_summary.append([
                 date_for_sheet,
                 "Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                "",  # Доход
-                abs(item_sum),  # Расход
+                0.0,  # C: float 0 (no income)
+                abs(item_sum),  # D: float expense
                 f"{fiscal_doc} - {item_name}"
             ])
 
-        if data.get("excluded_sum", 0) > 0:
+        excluded_sum = float(safe_float(data.get("excluded_sum", 0)))  # FIX: float
+        if excluded_sum > 0:
             rows_summary.append([
                 date_for_sheet,
                 "Услуга",
-                "", 
-                abs(data["excluded_sum"]),
+                0.0,  # C: 0
+                excluded_sum,  # D: float
                 f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
             ])
 
+        # Append to Чеки (only)
         await async_sheets_call(
             sheets_service.spreadsheets().values().append,
             spreadsheetId=SHEET_NAME,
@@ -186,6 +186,7 @@ async def save_receipt(
             body={"values": rows_checks}
         )
 
+        # Append summary data (for formulas; no updates)
         if rows_summary:
             await async_sheets_call(
                 sheets_service.spreadsheets().values().append,
@@ -195,8 +196,9 @@ async def save_receipt(
                 insertDataOption="INSERT_ROWS",
                 body={"values": rows_summary}
             )
+            logger.debug(f"Appended {len(rows_summary)} summary rows for formulas")
 
-        await update_fiscal_cache(str(fiscal_doc))
+        # REMOVED: All fixed updates (J1/M1/P1) — formulas handle
 
         logger.info(f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, позиций={len(rows_checks)}, user={user_name}")
         return True
@@ -206,42 +208,28 @@ async def save_receipt(
         return False
 
 async def save_receipt_summary(date: str, operation_type: str, sum_value: float, note: str):
-    logger.info(f"Сохранение summary: {sum_value}, note: {note}, type: {operation_type}")
+    """Append only data row for formulas (no fixed updates)."""
+    logger.debug(f"Summary append: {sum_value}, type: {operation_type}")  # Minimal
     try:
         formatted_date = normalize_date(date)
-
-        result = await async_sheets_call(
-            sheets_service.spreadsheets().values().get,
-            spreadsheetId=SHEET_NAME, range="Сводка!A:E"
-        )
-        rows = result.get("values", [])
-        
-        current_balance = 0.0
-        if len(rows) > 1:
-            last_row = rows[-1]
-            if len(last_row) > 4 and last_row[4]:
-                current_balance = safe_float(last_row[4])
+        adjusted_value = float(abs(sum_value))  # FIX: float
 
         if operation_type == "Возврат":
-            adjusted_value = abs(sum_value)
-            income = str(adjusted_value)
-            expense = ""
+            income = adjusted_value  # C: float return
+            expense = 0.0  # D: 0
         elif operation_type == "Услуга":
-            adjusted_value = -abs(sum_value)
-            income = ""
-            expense = str(abs(sum_value))
-        else:
-            adjusted_value = -abs(sum_value)
-            income = ""
-            expense = str(abs(sum_value))
+            income = 0.0
+            expense = adjusted_value
+        else:  # Расход
+            income = 0.0
+            expense = adjusted_value
 
-        new_balance = current_balance + adjusted_value
-
+        # Append data row only (for formulas)
         summary_row = [
             formatted_date,
             operation_type,
-            income,
-            expense,
+            income,  # C: float
+            expense,  # D: float
             note
         ]
 
@@ -250,24 +238,18 @@ async def save_receipt_summary(date: str, operation_type: str, sum_value: float,
             spreadsheetId=SHEET_NAME,
             range="Сводка!A:E",
             valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
             body={"values": [summary_row]}
         )
 
-        await async_sheets_call(
-            sheets_service.spreadsheets().values().update,
-            spreadsheetId=SHEET_NAME,
-            range="Сводка!I1",
-            valueInputOption="RAW",
-            body={"values": [[f"{new_balance:.2f}"]]}
-        )
-
-        logger.info(f"Summary saved: {summary_row}, new_balance={new_balance:.2f}")
+        logger.debug(f"Summary row appended: {summary_row[:2]}... (formulas will update)")
+        return True  # Success
 
     except HttpError as e:
-        logger.error(f"Ошибка записи в Сводка: {e.status_code} - {e.reason}")
+        logger.error(f"Ошибка append summary: {e.status_code} - {e.reason}")
         raise
     except Exception as e:
-        logger.error(f"Неожиданная ошибка записи в Сводка: {str(e)}")
+        logger.error(f"Ошибка summary: {str(e)}")
         raise
 
 def normalize_amount(value: str) -> float:
@@ -281,49 +263,47 @@ def normalize_amount(value: str) -> float:
 
 async def get_monthly_balance() -> dict:
     try:
-        # Расширенный range для capture всех rows (A1:O100) — захватит initial C2, fixed I1/L1/O1, и данные ниже
+        # Fetch only fixed (formulas in J1/M1/P1)
         result = await async_sheets_call(
             sheets_service.spreadsheets().values().get,
-            spreadsheetId=SHEET_NAME, range="Сводка!A1:O100"  # Полный: A-E data + fixed I/L/O
+            spreadsheetId=SHEET_NAME, range="Сводка!A1:Q1"  # Only row1 (fixed)
         )
         values = result.get("values", [])
-        logger.info(f"Balance values raw (first 3 rows): {values[:3] if values else 'EMPTY'}")  # Debug на INFO
+        logger.debug(f"Balance fixed row1 fetched")  # Minimal, no raw
 
-        # Fallback если пусто
         if not values:
-            logger.warning("No values in Сводка!A1:O100 — using defaults")
+            logger.warning("No fixed row in Сводка!A1:Q1 — using defaults")
             return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
 
-        # Initial balance: C2 (row1=header, row2=data; col C=index2 in full row, but wait — range A1:O → col A=0, B=1, C=2
-        # Правильные индексы для A1:O (A=0, B=1, C=2, D=3, E=4, ..., I=8, L=11, O=14)
-        initial_balance_value = values[1][2] if len(values) > 1 and len(values[1]) > 2 else "0"  # C2 (row1 col2)
-        initial_balance = normalize_amount(initial_balance_value)
+        row0 = values[0]
 
-        # Fixed cells in row0 (headers + formulas)
-        balance_value = values[0][8] if len(values) > 0 and len(values[0]) > 8 else "0"  # I1 (row0 col8)
-        balance = normalize_amount(balance_value.replace("=", "").strip())  # Убираем = из формул
+        # Initial from C2 (separate fetch, or assume set manually)
+        init_result = await async_sheets_call(
+            sheets_service.spreadsheets().values().get,
+            spreadsheetId=SHEET_NAME, range="Сводка!C2"
+        )
+        initial_balance_value = init_result.get("values", [[0]])[0][0]
+        initial_balance = normalize_amount(str(initial_balance_value))
 
-        spent_value = values[0][11] if len(values) > 0 and len(values[0]) > 11 else "0"  # L1 (row0 col11)
-        spent = normalize_amount(spent_value.replace("=", "").strip())
+        # Fixed from formulas
+        balance_value = row0[9] if len(row0) > 9 else "0"  # J1
+        balance = normalize_amount(str(balance_value).replace("=", "").strip())
 
-        returned_value = values[0][14] if len(values) > 0 and len(values[0]) > 14 else "0"  # O1 (row0 col14)
-        returned = normalize_amount(returned_value.replace("=", "").strip())
+        spent_value = row0[12] if len(row0) > 12 else "0"  # M1
+        spent = normalize_amount(str(spent_value).replace("=", "").strip())
 
-        # Если fixed пустые — посчитай из данных (fallback: sum расход/приход ниже row2)
-        if balance == 0.0 or spent == 0.0:
-            total_income = sum(normalize_amount(row[2]) for row in values[2:] if len(row) > 2)  # Приход C (col2)
-            total_expense = sum(normalize_amount(row[3]) for row in values[2:] if len(row) > 3)  # Расход D (col3)
-            calculated_balance = initial_balance + total_income - total_expense
-            calculated_spent = total_expense
-            calculated_returned = total_income  # Assuming returns in income
+        returned_value = row0[15] if len(row0) > 15 else "0"  # P1
+        returned = normalize_amount(str(returned_value).replace("=", "").strip())
 
-            balance = calculated_balance if balance == 0.0 else balance
-            spent = calculated_spent if spent == 0.0 else spent
-            returned = calculated_returned if returned == 0.0 else returned
+        # REMOVED: Fallback sum — trust formulas
 
-            logger.info(f"Calculated fallback: initial={initial_balance}, income={total_income}, expense={total_expense}, balance={calculated_balance}")
+        # Override if mismatch (safety)
+        computed_balance = initial_balance + returned - spent
+        if abs(balance - computed_balance) > 0.01:
+            logger.warning(f"Balance mismatch: formula={balance:.2f} ≠ computed={computed_balance:.2f}; using computed")
+            balance = computed_balance
 
-        logger.info(f"Balance fetched: initial={initial_balance}, spent={spent}, returned={returned}, balance={balance}")
+        logger.info(f"Balance from formulas: initial={initial_balance}, spent={spent}, returned={returned}, balance={balance}")
 
         return {
             "spent": round(spent, 2),

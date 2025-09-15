@@ -445,3 +445,69 @@ async def get_balance(message: Message):
     except Exception as e:
         await loading_message.edit_text(f"❌ Неожиданная ошибка: {str(e)}. Проверьте /debug.")
         logger.error(f"Неожиданная ошибка /balance: {str(e)}, user_id={message.from_user.id}")
+
+@router.message(Command("clear_cache"))
+async def clear_cache(message: Message):
+    if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
+        await message.answer("🚫 Доступ запрещен. Только администратор.")
+        logger.info(f"Доступ запрещен для /clear_cache: user_id={message.from_user.id}")
+        return
+    try:
+        # Clear fiscal
+        await redis_client.delete("fiscal_docs_set")
+        # Clear allowed (optional)
+        await redis_client.delete("allowed_users_list")
+        # Clear notified (optional, large?)
+        # await redis_client.delete("notified_items")  # Uncomment if need full reset
+        await message.answer("✅ Кэш очищен: fiscal_docs_set (и allowed). Проверьте /add.")
+        logger.info(f"Кэш очищен: user_id={message.from_user.id}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка очистки кэша: {str(e)}.")
+        logger.error(f"Ошибка /clear_cache: {str(e)}, user_id={message.from_user.id}")
+
+        from utils import redis_client  # Add import if not
+
+@router.message(Command("flush_cache"))
+async def flush_cache(message: Message):
+    if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
+        await message.answer("🚫 Доступ запрещен. Только администратор.")
+        logger.info(f"Доступ запрещен для /flush_cache: user_id={message.from_user.id}")
+        return
+    try:
+        # Nuclear: Clear all keys (or specific)
+        keys_to_del = await redis_client.keys("*")  # All keys
+        deleted = await redis_client.delete(*keys_to_del)
+        await message.answer(f"✅ Полная очистка кэша: удалено {deleted} ключей (all). Проверьте /add или /balance.")
+        logger.info(f"Full cache flush: deleted {deleted} keys, user_id={message.from_user.id}")
+        
+        # Optional: Test refresh
+        test_docs = await is_fiscal_doc_unique("test_flush")  # Force refresh, should unique
+        await message.answer(f"Тест unique 'test_flush': {test_docs} (should be True).")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка очистки: {str(e)}.")
+        logger.error(f"Ошибка /flush_cache: {str(e)}, user_id={message.from_user.id}")
+
+
+from sheets import sheets_service, async_sheets_call, SHEET_NAME  # Add imports
+
+@router.message(Command("clear_sheet"))
+async def clear_sheet(message: Message):
+    if message.from_user.id != YOUR_ADMIN_ID:  # Admin only
+        await message.answer("🚫 Доступ запрещен. Только администратор.")
+        return
+    try:
+        # Clear data in Чеки!A2:Q1000 (keep header row1)
+        await async_sheets_call(
+            sheets_service.spreadsheets().values().clear,
+            spreadsheetId=SHEET_NAME, range="Чеки!A2:Q1000"  # Clear all data below header
+        )
+        # Optional: Clear Сводка data (A2:E1000)
+        await async_sheets_call(
+            sheets_service.spreadsheets().values().clear,
+            spreadsheetId=SHEET_NAME, range="Сводка!A2:E1000"
+        )
+        await message.answer("✅ Листы 'Чеки' и 'Сводка' очищены (data rows deleted, headers kept). Проверьте /add или /debug.")
+        logger.info(f"Sheet cleared by admin user_id={message.from_user.id}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка очистки листа: {str(e)}.")
+        logger.error(f"Ошибка /clear_sheet: {str(e)}")

@@ -3,7 +3,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sheets import is_user_allowed, async_sheets_call, sheets_service, update_fiscal_cache, get_monthly_balance  # Полные imports
+from sheets import is_user_allowed, async_sheets_call, sheets_service, get_monthly_balance  # Полные imports
 from utils import safe_float, parse_qr_from_photo, reset_keyboard
 from handlers.notifications import send_notification
 from config import SHEET_NAME  # Для spreadsheetId
@@ -313,7 +313,6 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
     delivery_date_header = updated_items[0].get("delivery_date", datetime.now().strftime("%d.%m.%Y")) if updated_items else datetime.now().strftime("%d.%m.%Y")
 
     if fail == 0:
-        await update_fiscal_cache(new_fd)
         await send_notification(
             bot=callback.bot,
             action="📦 Подтверждена доставка",

@@ -5,7 +5,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
-from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt_summary, async_sheets_call, sheets_service, get_monthly_balance, update_fiscal_cache  # + balance/cache
+from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt_summary, async_sheets_call, sheets_service, get_monthly_balance  # + balance/cache
 from utils import parse_qr_from_photo, safe_float, reset_keyboard  # safe_float для sum
 from config import SHEET_NAME  # spreadsheetId
 from handlers.notifications import send_notification  # Уведомления (как в expenses)
@@ -44,10 +44,10 @@ async def process_fiscal_doc(message: Message, state: FSMContext):
     try:
         result = await async_sheets_call(
             sheets_service.spreadsheets().values().get,
-            spreadsheetId=SHEET_NAME, range="Чеки!A:O"
+            spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
         )
         rows = result.get("values", [])
-        logger.info(f"Loaded {len(rows)} rows from Чеки!A:O (first 2: {rows[:2] if len(rows) >= 2 else rows})")  # Debug
+        logger.info(f"Loaded {len(rows)} rows from Чеки!A:Q (first 2: {rows[:2] if len(rows) >= 2 else rows})")  # Debug
         receipts = [row for row in rows[1:] if len(row) > 13 and row[12] == fiscal_doc and row[8] != "Возвращен"]  # M=12 fiscal, I=8 != "Возвращен"
         if not receipts:
             await message.answer(f"Чеки с номером {fiscal_doc} не найдены или уже возвращены.", reply_markup=reset_keyboard())
@@ -255,8 +255,6 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 # Delivery header
                 delivery_date_header = updated_items[0].get("delivery_date", datetime.now().strftime("%d.%m.%Y")) if updated_items else datetime.now().strftime("%d.%m.%Y")
 
-                # Update cache for new_fd
-                await update_fiscal_cache(new_fiscal_doc)
 
                 # Уведомления (как в /expenses)
                 await send_notification(
