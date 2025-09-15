@@ -348,3 +348,12 @@ def reset_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="Сброс")]],
         resize_keyboard=True
     )
+
+
+def norm(s: str) -> str:
+    """
+    Нормализация строки для match (lower, strip, single spaces).
+    """
+    s = (s or "").lower()
+    s = " ".join(s.split())  # Удалить лишние пробелы
+    return s
