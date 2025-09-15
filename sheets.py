@@ -1,5 +1,6 @@
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
+import json
 import logging
 import asyncio
 from config import SHEET_NAME, GOOGLE_CREDENTIALS
@@ -8,6 +9,9 @@ from googleapiclient.errors import HttpError
 from utils import redis_client, cache_get, cache_set, safe_float, normalize_date
 
 logger = logging.getLogger("AccountingBot")
+# NOVOYE: Ключ для кэша баланса и время жизни (TTL)
+BALANCE_CACHE_KEY = "monthly_balance"  # Имя ключа в Redis
+BALANCE_EXPIRE = 30  # 30 секунд — баланс не меняется часто, но обновляем timely
 
 # Инициализация Google Sheets API
 creds = service_account.Credentials.from_service_account_info(
@@ -59,6 +63,15 @@ async def is_user_allowed(user_id: int) -> str | None:
     await cache_set(cache_key, None, expire=86400)
     logger.debug(f"User not allowed: user_id={user_id}")
     return None
+
+# NOVOYE: Внутренняя функция — проверяет кэш баланса
+async def _get_cached_balance() -> dict | None:
+    """Получает кэшированный баланс или None, если нет."""
+    cached = await cache_get(BALANCE_CACHE_KEY)  # Читаем из Redis по ключу
+    if cached:  # Если есть данные
+        logger.debug("Balance cache hit")  # Лог: "Кэш попал" (для отладки)
+        return json.loads(cached)  # Разбираем JSON-строку обратно в словарь
+    return None  # Нет кэша — вернём None
 
 async def is_fiscal_doc_unique(fiscal_doc: str) -> bool:
     try:
@@ -261,56 +274,60 @@ def normalize_amount(value: str) -> float:
         logger.error(f"Некорректное число: {value}")
         return 0.0
 
-async def get_monthly_balance() -> dict:
+async def get_monthly_balance(force_refresh: bool = False, use_computed: bool = False) -> dict:
+    """Получает баланс: Кэш или 1 запрос A1:Q2. use_computed=True — fallback расчёт, если mismatch."""
+    if not force_refresh:
+        cached = await _get_cached_balance()
+        if cached:
+            logger.info(f"Balance from cache: {cached['balance']:.2f}")
+            return cached
+
     try:
-        # Fetch only fixed (formulas in J1/M1/P1)
+        # 1 запрос на A1:Q2 (I1=8 balance, L1=11 spent, O1=14 returned + C2 initial)
         result = await async_sheets_call(
             sheets_service.spreadsheets().values().get,
-            spreadsheetId=SHEET_NAME, range="Сводка!A1:Q1"  # Only row1 (fixed)
+            spreadsheetId=SHEET_NAME, range="Сводка!A1:Q2"
         )
         values = result.get("values", [])
-        logger.debug(f"Balance fixed row1 fetched")  # Minimal, no raw
+        logger.debug("Balance A1:Q2 fetched")
 
-        if not values:
-            logger.warning("No fixed row in Сводка!A1:Q1 — using defaults")
+        if len(values) < 2:
+            logger.warning("No data in Сводка!A1:Q2 — defaults")
             return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
 
-        row0 = values[0]
+        row0 = values[0]  # Строка 1: I1=8 (баланс), L1=11 (расходы), O1=14 (возвраты)
+        row1 = values[1]  # Строка 2: C2 initial = row1[2]
 
-        # Initial from C2 (separate fetch, or assume set manually)
-        init_result = await async_sheets_call(
-            sheets_service.spreadsheets().values().get,
-            spreadsheetId=SHEET_NAME, range="Сводка!C2"
-        )
-        initial_balance_value = init_result.get("values", [[0]])[0][0]
-        initial_balance = normalize_amount(str(initial_balance_value))
+        # Initial из C2 (row1[2])
+        initial_balance = normalize_amount(str(row1[2]) if len(row1) > 2 else "0")
 
-        # Fixed from formulas
-        balance_value = row0[9] if len(row0) > 9 else "0"  # J1
+        # Фиксированные из row0 (ТВОИ ИНДЕКСЫ!)
+        balance_value = row0[8] if len(row0) > 8 else "0"  # I1=8 (остаток)
         balance = normalize_amount(str(balance_value).replace("=", "").strip())
 
-        spent_value = row0[12] if len(row0) > 12 else "0"  # M1
+        spent_value = row0[11] if len(row0) > 11 else "0"  # L1=11 (расходы)
         spent = normalize_amount(str(spent_value).replace("=", "").strip())
 
-        returned_value = row0[15] if len(row0) > 15 else "0"  # P1
+        returned_value = row0[14] if len(row0) > 14 else "0"  # O1=14 (возвраты)
         returned = normalize_amount(str(returned_value).replace("=", "").strip())
 
-        # REMOVED: Fallback sum — trust formulas
+        # Опциональный fallback: Если use_computed=True, проверяем и считаем
+        if use_computed:
+            computed_balance = initial_balance + returned - spent
+            if abs(balance - computed_balance) > 0.01:
+                logger.warning(f"Balance mismatch: formula={balance:.2f} ≠ computed={computed_balance:.2f}; using computed")
+                balance = computed_balance
+            # Можно добавить spent/returned computed, но по умолчанию — из таблицы
 
-        # Override if mismatch (safety)
-        computed_balance = initial_balance + returned - spent
-        if abs(balance - computed_balance) > 0.01:
-            logger.warning(f"Balance mismatch: formula={balance:.2f} ≠ computed={computed_balance:.2f}; using computed")
-            balance = computed_balance
-
-        logger.info(f"Balance from formulas: initial={initial_balance}, spent={spent}, returned={returned}, balance={balance}")
-
-        return {
+        result_data = {
             "spent": round(spent, 2),
             "returned": round(returned, 2),
             "balance": round(balance, 2),
             "initial_balance": round(initial_balance, 2),
         }
+        await cache_set(BALANCE_CACHE_KEY, json.dumps(result_data), expire=BALANCE_EXPIRE)
+        logger.info(f"Balance fetched/cached: {result_data['balance']:.2f} (from I1={balance_value}, L1={spent_value}, O1={returned_value})")
+        return result_data
 
     except HttpError as e:
         logger.error(f"Ошибка получения баланса: {e.status_code} - {e.reason}")
@@ -318,3 +335,84 @@ async def get_monthly_balance() -> dict:
     except Exception as e:
         logger.error(f"Ошибка получения баланса: {str(e)}")
         return {"spent": 0.0, "returned": 0.0, "balance": 0.0, "initial_balance": 0.0}
+
+# NOVOYE: Обновляет кэш баланса (для будущих этапов, после изменений)
+async def update_balance_cache(balance_data: dict):
+    """Обновляет кэш новыми данными баланса (после add/return)."""
+    await cache_set(BALANCE_CACHE_KEY, json.dumps(balance_data), expire=BALANCE_EXPIRE)
+    logger.debug("Balance cache updated")  # Лог: "Кэш обновлён"
+
+# NOVOYE: Helper для delta-расчёта баланса (для confirm)
+async def compute_delta_balance(operation_type: str, total_sum: float, old_balance_data: dict | None = None) -> dict:
+    """
+    Вычисляет новый баланс по delta (без API).
+    operation_type: 'add' (расход, -sum), 'return' (доход, +sum), 'delivery' (0, no change).
+    old_balance_data: Из кэша (если None — get cached).
+    Возвращает новый dict для кэша/уведомлений.
+    """
+    if old_balance_data is None:
+        old_balance_data = await _get_cached_balance() or {"balance": 0.0, "spent": 0.0, "returned": 0.0, "initial_balance": 0.0}
+
+    old_balance = old_balance_data["balance"]
+    old_spent = old_balance_data["spent"]
+    old_returned = old_balance_data["returned"]
+    initial = old_balance_data["initial_balance"]
+
+    new_balance = old_balance
+    new_spent = old_spent
+    new_returned = old_returned
+
+    if operation_type == "add":  # Покупка/расход
+        new_balance = old_balance - total_sum
+        new_spent = old_spent + total_sum
+    elif operation_type == "return":  # Возврат/доход
+        new_balance = old_balance + total_sum
+        new_returned = old_returned + total_sum
+    elif operation_type == "delivery":  # Подтверждение — no change (status only)
+        new_balance = old_balance  # Или + доплата, если есть
+        # new_spent/returned unchanged
+    else:
+        logger.warning(f"Unknown operation_type: {operation_type}, no delta")
+
+    # Computed check (safety, optional)
+    computed = initial + new_returned - new_spent
+    if abs(new_balance - computed) > 0.01:
+        logger.debug(f"Delta mismatch: {new_balance:.2f} ≠ computed {computed:.2f}; using delta")
+        new_balance = computed
+
+    new_data = {
+        "spent": round(new_spent, 2),
+        "returned": round(new_returned, 2),
+        "balance": round(new_balance, 2),
+        "initial_balance": round(initial, 2),
+    }
+    logger.info(f"Delta computed: op={operation_type}, sum={total_sum:.2f}, old_balance={old_balance:.2f} → new={new_balance:.2f}")
+    return new_data
+
+# NOVOYE: Update cache with new data (after delta)
+async def update_balance_cache_with_delta(new_balance_data: dict):
+    """Обновляет кэш новым балансом после операции."""
+    await cache_set(BALANCE_CACHE_KEY, json.dumps(new_balance_data), expire=BALANCE_EXPIRE)
+    logger.debug("Balance cache updated with delta")
+
+    # NOVOYE: Batch update для нескольких строк (1 API call вместо N)
+async def batch_update_sheets(updates: list):
+    """Batch update values в sheets (list of {'range': 'A1:Q1', 'values': [[...]]})."""
+    try:
+        body = {
+            "valueInputOption": "RAW",
+            "data": updates  # [{'range': ..., 'values': [[row]]}, ...]
+        }
+        result = await async_sheets_call(
+            sheets_service.spreadsheets().values().batchUpdate,
+            spreadsheetId=SHEET_NAME,
+            body=body
+        )
+        logger.debug(f"Batch update: {len(updates)} ranges, updated {result.get('totalUpdatedRows', 0)} rows")
+        return True
+    except HttpError as e:
+        logger.error(f"Batch update error: {e.status_code} - {e.reason}")
+        return False
+    except Exception as e:
+        logger.error(f"Batch update exception: {str(e)}")
+        return False

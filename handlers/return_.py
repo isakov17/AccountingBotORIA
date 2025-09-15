@@ -5,7 +5,19 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
-from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt_summary, async_sheets_call, sheets_service, get_monthly_balance  # + balance/cache
+from sheets import (
+    is_user_allowed, 
+    save_receipt, 
+    save_receipt_summary,
+    is_fiscal_doc_unique,
+    async_sheets_call,
+    sheets_service,  # Если используется
+    SHEET_NAME,  # Если используется
+    get_monthly_balance,  # Для других частей, если нужно
+    # NOVOYE: Импорт delta helpers из sheets.py
+    compute_delta_balance,
+    update_balance_cache_with_delta,
+)
 from utils import parse_qr_from_photo, safe_float, reset_keyboard  # safe_float для sum
 from config import SHEET_NAME  # spreadsheetId
 from handlers.notifications import send_notification  # Уведомления (как в expenses)
@@ -177,6 +189,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
     logger.info(f"Возврат подготовлен к подтверждению: old_fiscal_doc={fiscal_doc}, new_fiscal_doc={new_fiscal_doc}, item={item_name}, user_id={message.from_user.id}")
 
 # Обработчик подтверждения/отмены возврата
+# Обработчик подтверждения/отмены возврата
+# Обработчик подтверждения/отмены возврата
 @return_router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -196,22 +210,24 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
         ok, fail, errors = 0, 0, []
         updated_items = []
         row_updated = False
+        total_sum = 0.0
 
         try:
-            # Async get A:Q (full, as in expenses)
+            # Direct get full A:Q (как в твоём коде, ~0.3с)
             result = await async_sheets_call(
                 sheets_service.spreadsheets().values().get,
                 spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
             )
-            rows = result.get("values", [])[1:]
-            logger.info(f"Confirm loaded {len(rows)} rows from Чеки!A:Q (first 2: {rows[:2] if len(rows) >= 2 else rows})")  # Debug
+            rows = result.get("values", [])[1:]  # Skip header
+            logger.debug(f"Return confirm: Loaded {len(rows)} rows from Чеки!A:Q")
 
             for i, row in enumerate(rows, start=2):
-                if len(row) > 13 and row[12] == fiscal_doc and row[10] == item_name:  # M=12 fiscal, K=10 item
-                    while len(row) < 17:  # Pad for Q=16
+                if len(row) > 13 and row[12] == fiscal_doc and row[10] == item_name:
+                    while len(row) < 17:
                         row.append("")
-                    row[8] = "Возвращен"  # I=8 status
-                    row[14] = parsed_data["qr_string"]  # O=14 qr_return
+                    row[8] = "Возвращен"  # I=8
+                    row[14] = parsed_data["qr_string"]  # O=14
+
                     await async_sheets_call(
                         sheets_service.spreadsheets().values().update,
                         spreadsheetId=SHEET_NAME,
@@ -220,49 +236,45 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                         body={"values": [row]}
                     )
                     row_updated = True
-                    total_sum = safe_float(row[2]) if row[2] else 0.0  # C=2 sum
+
+                    total_sum = safe_float(row[2]) if row[2] else 0.0  # C=2
                     note = f"{new_fiscal_doc} - {item_name}"
                     await save_receipt_summary(parsed_data.get("date", datetime.now().strftime("%d.%m.%Y")), "Возврат", total_sum, note)
 
-                    # Collect updated_items (как в expenses)
+                    # Updated items
                     link = row[15].strip() if len(row) > 15 else ""
                     comment = row[16].strip() if len(row) > 16 else ""
                     delivery_date = row[7].strip() if row[7] else ""
                     updated_items.append({
                         "name": item_name,
                         "sum": total_sum,
-                        "quantity": int(row[4] or 1),  # E=4 qty
+                        "quantity": int(row[4] or 1),
                         "link": link,
                         "comment": comment,
                         "delivery_date": delivery_date
                     })
 
-                    logger.info(f"Обновлена строка в Чеки: row={i}, fiscal_doc={new_fiscal_doc}, link={link}, comment={comment}, delivery_date={delivery_date}")
+                    logger.info(f"Обновлена строка в Чеки: row={i}, fiscal_doc={new_fiscal_doc}")
                     ok += 1
-                    break  # Single item
+                    break
                 else:
                     fail += 1
                     errors.append(f"Строка {i}: Товар не найден")
 
             if row_updated:
-                # Balance
-                balance_data = await get_monthly_balance()
-                balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+                # Force fetch реального баланса (~0.3с)
+                balance_data = await get_monthly_balance(force_refresh=True)
+                balance = balance_data.get("balance", 0.0) if balance_data else 0.0
 
-                # User name
                 user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
-
-                # Delivery header
                 delivery_date_header = updated_items[0].get("delivery_date", datetime.now().strftime("%d.%m.%Y")) if updated_items else datetime.now().strftime("%d.%m.%Y")
 
-
-                # Уведомления (как в /expenses)
                 await send_notification(
                     bot=callback.bot,
                     action="↩️ Возврат подтверждён",
                     items=updated_items,
                     user_name=user_name,
-                    fiscal_doc=new_fiscal_doc,  # Новый FD
+                    fiscal_doc=new_fiscal_doc,
                     delivery_date=delivery_date_header,
                     balance=balance,
                     is_group=True
@@ -281,12 +293,16 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 )
 
                 await callback.message.edit_text(f"✅ Возврат товара {item_name} подтверждён. Фискальный номер: {new_fiscal_doc}. Сумма: {total_sum:.2f} RUB.\n🟰 Остаток: {balance:.2f} RUB.")
-                logger.info(f"Возврат подтверждён: old_fiscal_doc={fiscal_doc}, new_fiscal_doc={new_fiscal_doc}, item={item_name}, total_sum={total_sum}, row={i}, user_id={callback.from_user.id}")
+                logger.info(f"Возврат подтверждён: old_fiscal_doc={fiscal_doc}, new_fiscal_doc={new_fiscal_doc}, item={item_name}, total_sum={total_sum}, balance={balance}, user_id={callback.from_user.id}")
 
             else:
+                # Fetch даже при ошибках
+                balance_data = await get_monthly_balance(force_refresh=True)
+                balance = balance_data.get("balance", 0.0) if balance_data else 0.0
+
                 details = "\n".join(errors[:10])
                 more = f"\n…и ещё {len(errors)-10}" if len(errors) > 10 else ""
-                await callback.message.edit_text(f"⚠️ Частично: успешно {ok}, ошибок {fail}.\n{details}{more}")
+                await callback.message.edit_text(f"⚠️ Частично: успешно {ok}, ошибок {fail}.\n{details}{more}\nОстаток: {balance:.2f} RUB")
                 logger.info(f"Товар не найден для возврата: fiscal_doc={fiscal_doc}, item={item_name}, user_id={callback.from_user.id}")
 
         except HttpError as e:

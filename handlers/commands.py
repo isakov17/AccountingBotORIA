@@ -409,34 +409,37 @@ async def get_balance(message: Message):
         logger.info(f"Доступ запрещен для /balance: user_id={message.from_user.id}")
         return
 
-    loading_message = await message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
+    loading_message = await message.answer("⌛ Получение баланса...")  # Короткий текст, чтобы пользователь видел прогресс
     try:
-        balance_data = await get_monthly_balance()
-        if balance_data:
+        # NOVOYE: Вызываем функцию с кэшем (по умолчанию force_refresh=False)
+        balance_data = await get_monthly_balance()  # Автоматически: кэш или 1 запрос
+        if balance_data:  # Если данные ок
             initial_balance = balance_data.get("initial_balance", 0.0)
-            spent = abs(balance_data.get("spent", 0.0))
+            spent = abs(balance_data.get("spent", 0.0))  # abs, если минус
             returned = balance_data.get("returned", 0.0)
             balance = balance_data.get("balance", 0.0)
 
+            # Дата обновления: Оставляем отдельный запрос (малозначительный, ~0.1с; можно объединить позже)
             try:
                 date_result = await async_sheets_call(
                     sheets_service.spreadsheets().values().get,
-                    spreadsheetId=SHEET_NAME, range="Сводка!A1"
+                    spreadsheetId=SHEET_NAME, range="Сводка!A1"  # Только A1 для даты
                 )
                 update_date = date_result.get("values", [[datetime.now().strftime("%d.%m.%Y")]])[0][0]
             except Exception:
-                update_date = datetime.now().strftime("%d.%m.%Y")
-                logger.warning("Не удалось получить дату обновления из A1, используется текущая дата")
+                update_date = datetime.now().strftime("%d.%m.%Y")  # Fallback текущая дата
+                logger.warning("Не удалось получить дату из A1, используем текущую")
 
+            # Формируем ответ (как раньше)
             await loading_message.edit_text(
                 f"💸 Баланс на {update_date}:\n"
                 f"💰 Начальный баланс: {initial_balance:.2f} RUB\n"
                 f"➖ Потрачено: {spent:.2f} RUB\n"
                 f"➕ Возвращено: {returned:.2f} RUB\n"
                 f"🟰 Остаток: {balance:.2f} RUB",
-                parse_mode="Markdown"
+                parse_mode="Markdown"  # Для форматирования
             )
-            logger.info(
+            logger.info(  # Лог для мониторинга
                 f"Баланс выдан: initial_balance={initial_balance}, spent={spent}, returned={returned}, balance={balance}, user_id={message.from_user.id}"
             )
         else:

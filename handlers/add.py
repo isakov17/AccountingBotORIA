@@ -3,7 +3,19 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sheets import is_user_allowed, is_fiscal_doc_unique, save_receipt, get_monthly_balance, async_sheets_call, sheets_service  # Полные imports
+from sheets import (
+    is_user_allowed, 
+    save_receipt, 
+    is_fiscal_doc_unique,
+    async_sheets_call,
+    sheets_service,  # Если используется
+    SHEET_NAME,  # Если используется
+    get_monthly_balance,  # Для других частей, если нужно
+    # NOVOYE: Импорт delta helpers из sheets.py
+    compute_delta_balance,
+    update_balance_cache_with_delta
+)
+
 from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
@@ -434,7 +446,7 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
 @add_router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "confirm_add")
 async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    loading_message = await callback.message.answer("⌛ Обработка запроса... Пожалуйста, подождите.")
+    loading_message = await callback.message.answer("⌛ Сохранение чека...")
 
     data = await state.get_data()
     receipt: dict = data.get("receipt", {})
@@ -446,37 +458,43 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
         await state.clear()
         return
 
-    logger.info(
-        f"Перед сохранением чека: fiscal_doc={parsed_data.get('fiscal_doc', '')}, "
-        f"items={receipt.get('items', [])}, user_id={callback.from_user.id}"
-    )
+    # Вычисляем total_sum (для лога, optional)
+    items = receipt.get("items", [])
+    total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
+    excluded_sum = safe_float(parsed_data.get("excluded_sum", 0))
+    total_sum += excluded_sum
+
+    logger.info(f"Add confirm: fiscal_doc={parsed_data.get('fiscal_doc', '')}, total_sum={total_sum:.2f}, user={callback.from_user.id}")
 
     saved = await save_receipt(receipt, user_name=user_name)
 
     if saved:
-        balance_data = await get_monthly_balance()
-        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+        # Force fetch реального баланса из таблицы (~0.3с, обновит кэш)
+        balance_data = await get_monthly_balance(force_refresh=True)
+        balance = balance_data.get("balance", 0.0) if balance_data else 0.0
 
         delivery_dates = receipt.get("delivery_dates", [])
         delivery_date_header = delivery_dates[0] if delivery_dates else "Не указана"
 
-        items = []
-        for i, item in enumerate(receipt.get("items", [])):
+        # Items для уведомлений
+        items_list = []
+        for i, item in enumerate(items):
             deliv_date = delivery_dates[i] if i < len(delivery_dates) else ""
-            items.append({
+            items_list.append({
                 "name": item.get("name", "—"),
                 "sum": safe_float(item.get("sum", 0)),
                 "price": safe_float(item.get("price", 0)),
                 "quantity": int(item.get("quantity", 1) or 1),
-                "link": item.get("link", ""),
-                "comment": item.get("comment", ""),
+                "link": receipt.get("links", [None])[i] if i < len(receipt.get("links", [])) else "",
+                "comment": receipt.get("comments", [None])[i] if i < len(receipt.get("comments", [])) else "",
                 "delivery_date": deliv_date
             })
 
+        # Уведомления с реальным balance
         await send_notification(
             bot=callback.bot,
             action="🆕 Добавлен чек",
-            items=items,
+            items=items_list,
             user_name=user_name,
             fiscal_doc=parsed_data.get("fiscal_doc", ""),
             delivery_date=delivery_date_header,
@@ -487,7 +505,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
         await send_notification(
             bot=callback.bot,
             action="🆕 Чек добавлен",
-            items=items,
+            items=items_list,
             user_name=user_name,
             fiscal_doc=parsed_data.get("fiscal_doc", ""),
             delivery_date=delivery_date_header,
@@ -497,16 +515,11 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
         )
 
         await loading_message.delete()
+        await callback.message.answer(f"✅ Чек сохранён! Остаток: {balance:.2f} RUB")
+        logger.info(f"Чек добавлен: fiscal_doc={parsed_data.get('fiscal_doc', '')}, total={total_sum:.2f}, balance={balance}, user={user_name}")
     else:
-        await loading_message.edit_text(
-            f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc', '')}."
-        )
+        await loading_message.edit_text(f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc', '')}.")
 
-    logger.info(
-        f"Чек подтвержден: fiscal_doc={parsed_data.get('fiscal_doc', '')}, "
-        f"positions={len(receipt.get('items', []))}, balance={balance}, "
-        f"user_id={callback.from_user.id}, user_name={user_name}"
-    )
     await state.clear()
 
 @add_router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "cancel_add")
