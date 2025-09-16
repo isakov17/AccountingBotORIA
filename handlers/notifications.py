@@ -90,10 +90,10 @@ async def send_notification(
 
 async def send_notifications(bot: Bot):
     """Проверка таблицы и напоминания (async)."""
-    logger.info("Начало выполнения send_notifications")
+    logger.info("🚀 Начало выполнения send_notifications")
     today = datetime.now()
     if today.weekday() >= 5:  # Sat/Sun
-        logger.info("Уведомления не отправляются в выходные")
+        logger.info(f"⏭️ Уведомления не отправляются в выходные (weekday={today.weekday()})")
         return
 
     try:
@@ -101,41 +101,62 @@ async def send_notifications(bot: Bot):
             sheets_service.spreadsheets().values().get,
             spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
         )
-        rows = result.get("values", [])[1:]
-        logger.info(f"Загружено {len(rows)} строк из Google Sheets")
+        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        logger.info(f"📊 Загружено {len(rows)} строк из Google Sheets (range A:Q)")
 
         if not rows:
+            logger.warning("⚠️ Нет данных в таблице 'Чеки'")
             return
 
         today_str = today.strftime("%d.%m.%Y")
         three_days_ago = (today - timedelta(days=3)).strftime("%d.%m.%Y")
+        logger.info(f"📅 Today: '{today_str}', 3 days ago: '{three_days_ago}'")
 
+        notified_count = 0
+        skipped_count = 0
         for idx, row in enumerate(rows, start=2):
+            logger.info(f"🔍 Обработка row {idx}: len(row)={len(row)}, raw_row[7:13]={[str(x)[:20] for x in row[7:13]]}")  # Видимый лог для КАЖДОЙ строки (H=delivery, I=status, M=fiscal)
+
             if len(row) < 17:
+                logger.info(f"⏭️ Row {idx}: Пропуск (len(row)={len(row)} < 17)")
+                skipped_count += 1
                 continue
 
-            fiscal_doc = row[12].strip() if row[12] else ""
+            fiscal_doc = (row[12] or "").strip()
             if not fiscal_doc:
+                logger.info(f"⏭️ Row {idx}: Пропуск (fiscal_doc пустой: '{row[12]}')")
+                skipped_count += 1
                 continue
 
-            status = row[8].strip().lower() if row[8] else ""
-            delivery_date = row[7].strip() if row[7] else ""
+            status_raw = row[8] if row[8] else ""
+            status = status_raw.strip().lower().replace(" ", "")  # Удаляем пробелы/символы для надёжности (e.g., "Ожидает " → "ожидает")
+            delivery_date_raw = row[7] if row[7] else ""
+            delivery_date = delivery_date_raw.strip()  # Только strip
+
+            logger.info(f"🔍 Row {idx}: fiscal_doc='{fiscal_doc}', status_raw='{status_raw}' → status='{status}', delivery_date='{delivery_date}'")
 
             if status != "ожидает" or delivery_date not in [today_str, three_days_ago]:
+                reason = "status != 'ожидает'" if status != "ожидает" else f"date '{delivery_date}' != '{today_str}/{three_days_ago}'"
+                logger.info(f"⏭️ Row {idx}: Пропуск ({reason})")
+                skipped_count += 1
                 continue
 
-            notification_key = f"{fiscal_doc}_{idx}"
-            if await redis_client.sismember("notified_items", notification_key):
-                continue
+            # ❌ ВРЕМЕННО ОТКЛЮЧЁН: Redis-check (чтобы уведомления приходили каждый раз для теста)
+            # notification_key = f"{fiscal_doc}_{idx}"
+            # if await redis_client.sismember("notified_items", notification_key):
+            #     logger.info(f"⏭️ Row {idx}: Уже уведомлено (Redis key: {notification_key})")
+            #     skipped_count += 1
+            #     continue
 
-            item_name = row[10].strip() if row[10] else ""
+            # Подготовка items
+            item_name = (row[10] or "").strip()
             item_sum = safe_float(row[2]) if row[2] else 0.0
             qty = int(row[4]) if row[4] else 1
-            item_link = row[15].strip() if len(row) > 15 else ""
-            item_comment = row[16].strip() if len(row) > 16 else ""
+            item_link = (row[15] or "").strip() if len(row) > 15 else ""
+            item_comment = (row[16] or "").strip() if len(row) > 16 else ""
 
             items = [{
-                "name": item_name,
+                "name": item_name or "Неизвестно",
                 "sum": item_sum,
                 "quantity": qty,
                 "link": item_link,
@@ -143,14 +164,17 @@ async def send_notifications(bot: Bot):
                 "delivery_date": delivery_date
             }]
 
-            user_name = row[5].strip() if row[5] else ""
+            user_name = (row[5] or "").strip() or "Неизвестно"
+
+            logger.info(f"📤 Подготовка уведомления для row {idx}: {fiscal_doc}, item='{item_name[:30]}...', user={user_name}, sum={item_sum}")
 
             balance_data = await get_monthly_balance()
             balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+            logger.info(f"💰 Баланс для уведомления: {balance:.2f}")
 
             delivery_date_header = delivery_date
 
-            # Send group only (as per original)
+            # Send group only
             await send_notification(
                 bot=bot,
                 action="📦 Напоминание о доставке",
@@ -162,28 +186,30 @@ async def send_notifications(bot: Bot):
                 is_group=True
             )
             
+            notified_count += 1
+            
+            # ❌ ВРЕМЕННО ОТКЛЮЧЁН: Добавление в Redis (раскомментируй для прод/блокировки повторов)
+            # await redis_client.sadd("notified_items", notification_key)
+            
             # Rate limit
             await asyncio.sleep(random.uniform(1, 3))
             
-            await redis_client.sadd("notified_items", notification_key)
-            logger.info(f"Отправлено напоминание: fiscal_doc={fiscal_doc}, row={idx}, item={item_name[:50]}..., delivery_date={delivery_date}")
+            logger.info(f"✅ Успешно отправлено: fiscal_doc={fiscal_doc}, row={idx}, item={item_name[:50]}..., delivery_date={delivery_date}")
+
+        logger.info(f"📊 Завершено: отправлено {notified_count} уведомлений, пропущено {skipped_count} строк из {len(rows)}")
 
     except HttpError as e:
-        logger.error(f"Ошибка получения чеков: {e.status_code} - {e.reason}")
+        logger.error(f"❌ Ошибка получения чеков: {e.status_code} - {e.reason}")
         await asyncio.sleep(60)
     except Exception as e:
-        logger.error(f"Неожиданная ошибка отправки уведомлений: {str(e)}")
+        logger.error(f"❌ Неожиданная ошибка отправки уведомлений: {str(e)}")
         await asyncio.sleep(60)
 
+
 def start_notifications(bot: Bot):
-    # Prod: Cron mon-fri 15:00
-    # Test: interval 1min (env? Hardcode)
-    if os.getenv("ENV") == "prod":  # Assume .env ENV=prod
-        trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow")
-        logger.info("Уведомления: будние 15:00")
-    else:
-        trigger = IntervalTrigger(minutes=1)
-        logger.info("Уведомления: тест 1min")
+    # ✅ АКТИВНЫЙ ВАРИАНТ: ТЕСТОВЫЙ — каждую минуту (для разработки/тестирования)
+    trigger = IntervalTrigger(minutes=1)
+    logger.info("Уведомления: тест 1min")
     
     scheduler.add_job(
         send_notifications,
@@ -192,3 +218,19 @@ def start_notifications(bot: Bot):
         max_instances=1,
     )
     scheduler.start()
+
+    # ❌ ЗАКОММЕНТИРОВАННЫЙ ВАРИАНТ: ПРОДОВЫЙ — cron mon-fri 15:00 (раскомментируй для продакшена)
+    # if os.getenv("ENV") == "prod":  # Или просто раскомментируй весь блок
+    #     trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow")
+    #     logger.info("Уведомления: будние 15:00")
+    #     
+    #     scheduler.add_job(
+    #         send_notifications,
+    #         trigger=trigger,
+    #         args=[bot],
+    #         max_instances=1,
+    #     )
+    #     scheduler.start()
+    # else:
+    #     # Fallback: тестовый, если не прод
+    #     pass  # Или перенаправь на тестовый блок выше
