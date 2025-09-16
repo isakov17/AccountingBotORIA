@@ -88,6 +88,78 @@ async def send_notification(
     except Exception as e:
         logger.error(f"Ошибка при отправке уведомления {'группе' if is_group else f'chat_id={chat_id}'}: {str(e)}")
 
+async def send_notification(
+    bot: Bot,
+    action: str,
+    items: list[dict],
+    user_name: str,
+    fiscal_doc: str,
+    delivery_date: str,
+    balance: float,
+    is_group: bool = False,
+    chat_id: int = None
+):
+    """
+    Объединённая отправка уведомления (user или group).
+    """
+    try:
+        normalized_items = [
+            {
+                "name": item.get("name", "—"),
+                "sum": safe_float(item.get("sum", 0)),
+                "quantity": int(item.get("quantity", 1) or 1),
+                "price": safe_float(item.get("price", item.get("sum", 0) / max(item.get("quantity", 1), 1))),  # Если no price
+                "link": item.get("link", ""),
+                "comment": item.get("comment", ""),
+                "delivery_date": item.get("delivery_date", ""),
+            }
+            for item in items
+        ]
+
+        total_sum = sum(it["sum"] for it in normalized_items)
+        total_positions = len(normalized_items)
+
+        all_dates = [it["delivery_date"] for it in normalized_items if it["delivery_date"]]
+        date_header = delivery_date
+        if all_dates and len(set(all_dates)) == 1:
+            date_header = all_dates[0]
+        elif all_dates:
+            date_header = "Разные даты"
+
+        items_text = "\n".join(
+            f"  • {it['name']} — {it['quantity']} шт. × {it['price']:.2f} ₽ (итого {it['sum']:.2f} ₽)"
+            + (f"\n    📅 {it['delivery_date']}" if it['delivery_date'] else "")
+            + (f"\n    🔗 {it['link']}" if it['link'] else "")
+            + (f"\n    💬 {it['comment']}" if it['comment'] else "")
+            for it in normalized_items
+        )
+
+        text = (
+            f"{action}\n\n"
+            f"👤 Пользователь: {user_name}\n"
+            f"📑 Фискальный номер: {fiscal_doc}\n"
+            f"📅 Дата доставки: {date_header}\n\n"
+            f"🛒 Товары ({total_positions} шт.):\n{items_text}\n\n"
+            f"📦 Всего позиций: {total_positions}\n"
+            f"💰 Общая сумма: {total_sum:.2f} ₽\n"
+            f"💳 Баланс: {balance:.2f} ₽"
+        )
+
+        reply_markup = None
+        target_chat = GROUP_CHAT_ID if is_group else chat_id
+        if is_group:
+            reply_markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Открыть бота", url="https://t.me/TESTAccountingORIABot")]
+                ]
+            )
+
+        await bot.send_message(target_chat, text, reply_markup=reply_markup)
+        logger.info(f"📨 Уведомление отправлено {'группе' if is_group else 'пользователю'}: {action}, чек={fiscal_doc}, chat={target_chat}")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке уведомления {'группе' if is_group else f'chat_id={chat_id}'}: {str(e)}")
+
 async def send_notifications(bot: Bot):
     """Проверка таблицы и напоминания (async)."""
     logger.info("🚀 Начало выполнения send_notifications")
@@ -117,8 +189,9 @@ async def send_notifications(bot: Bot):
         for idx, row in enumerate(rows, start=2):
             logger.info(f"🔍 Обработка row {idx}: len(row)={len(row)}, raw_row[7:13]={[str(x)[:20] for x in row[7:13]]}")  # Видимый лог для КАЖДОЙ строки (H=delivery, I=status, M=fiscal)
 
-            if len(row) < 17:
-                logger.info(f"⏭️ Row {idx}: Пропуск (len(row)={len(row)} < 17)")
+            # ✅ ФИКС: Снижаем порог до 13 (минимум A-M: до fiscal/status/date). P/Q optional.
+            if len(row) < 13:
+                logger.info(f"⏭️ Row {idx}: Пропуск (len(row)={len(row)} < 13 — слишком короткая строка)")
                 skipped_count += 1
                 continue
 
@@ -150,8 +223,9 @@ async def send_notifications(bot: Bot):
 
             # Подготовка items
             item_name = (row[10] or "").strip()
-            item_sum = safe_float(row[2]) if row[2] else 0.0
-            qty = int(row[4]) if row[4] else 1
+            item_sum = safe_float(row[2]) if len(row) > 2 and row[2] else 0.0  # Безопасно для C=сумма
+            qty = int(row[4]) if len(row) > 4 and row[4] else 1  # E=qty
+            # ✅ ФИКС: Optional P/Q с проверкой len
             item_link = (row[15] or "").strip() if len(row) > 15 else ""
             item_comment = (row[16] or "").strip() if len(row) > 16 else ""
 
@@ -164,7 +238,7 @@ async def send_notifications(bot: Bot):
                 "delivery_date": delivery_date
             }]
 
-            user_name = (row[5] or "").strip() or "Неизвестно"
+            user_name = (row[5] or "").strip() or "Неизвестно"  # F=user
 
             logger.info(f"📤 Подготовка уведомления для row {idx}: {fiscal_doc}, item='{item_name[:30]}...', user={user_name}, sum={item_sum}")
 
@@ -207,9 +281,9 @@ async def send_notifications(bot: Bot):
 
 
 def start_notifications(bot: Bot):
-    # ✅ АКТИВНЫЙ ВАРИАНТ: ТЕСТОВЫЙ — каждую минуту (для разработки/тестирования)
-    trigger = IntervalTrigger(minutes=1)
-    logger.info("Уведомления: тест 1min")
+    # ✅ АКТИВНЫЙ ВАРИАНТ: ПРОДОВЫЙ — cron mon-fri 12:00 МСК (будние дни в 12:00)
+    trigger = CronTrigger(day_of_week="mon-fri", hour=12, minute=0, timezone="Europe/Moscow")
+    logger.info("🔔 Уведомления: будние 12:00 (прод режим)")
     
     scheduler.add_job(
         send_notifications,
@@ -218,19 +292,17 @@ def start_notifications(bot: Bot):
         max_instances=1,
     )
     scheduler.start()
+    logger.info("🕐 Scheduler уведомлений запущен (прод режим)")
 
-    # ❌ ЗАКОММЕНТИРОВАННЫЙ ВАРИАНТ: ПРОДОВЫЙ — cron mon-fri 15:00 (раскомментируй для продакшена)
-    # if os.getenv("ENV") == "prod":  # Или просто раскомментируй весь блок
-    #     trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone="Europe/Moscow")
-    #     logger.info("Уведомления: будние 15:00")
-    #     
-    #     scheduler.add_job(
-    #         send_notifications,
-    #         trigger=trigger,
-    #         args=[bot],
-    #         max_instances=1,
-    #     )
-    #     scheduler.start()
-    # else:
-    #     # Fallback: тестовый, если не прод
-    #     pass  # Или перенаправь на тестовый блок выше
+    # ❌ ЗАКОММЕНТИРОВАННЫЙ ВАРИАНТ: ТЕСТОВЫЙ — каждую минуту (раскомментируй для разработки/тестирования)
+    # trigger = IntervalTrigger(minutes=1)
+    # logger.info("🔔 Уведомления: тест 1min (каждую минуту)")
+    # 
+    # scheduler.add_job(
+    #     send_notifications,
+    #     trigger=trigger,
+    #     args=[bot],
+    #     max_instances=1,
+    # )
+    # scheduler.start()
+    # logger.info("🕐 Scheduler уведомлений запущен (тестовый режим)")
