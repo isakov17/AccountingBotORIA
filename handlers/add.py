@@ -25,6 +25,7 @@ from datetime import datetime
 import re
 import calendar
 
+
 logger = logging.getLogger("AccountingBot")
 add_router = Router()
 
@@ -425,6 +426,11 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
         "customer": data.get("customer", "Неизвестно")
     }
 
+    # ✅ НОВОЕ: Копируем excluded_sum и excluded_items из parsed_data в receipt
+    # Это позволит save_receipt в sheets.py правильно добавить строку "Услуга" в Сводку
+    receipt["excluded_sum"] = safe_float(parsed_data.get("excluded_sum", 0))
+    receipt["excluded_items"] = parsed_data.get("excluded_items", [])
+
     details = (
         f"Детали чека:\n"
         f"Магазин: {receipt['store']}\n"
@@ -450,7 +456,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
 
     data = await state.get_data()
     receipt: dict = data.get("receipt", {})
-    parsed_data: dict = data.get("parsed_data", {})
+    # parsed_data: dict = data.get("parsed_data", {})  # ❌ УДАЛИТЬ: больше не нужен
+
     user_name = await is_user_allowed(callback.from_user.id)
 
     if not user_name:
@@ -461,10 +468,11 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
     # Вычисляем total_sum (для лога, optional)
     items = receipt.get("items", [])
     total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
-    excluded_sum = safe_float(parsed_data.get("excluded_sum", 0))
+    # ✅ ИЗМЕНЕНИЕ: Берем excluded_sum из receipt (теперь он там есть)
+    excluded_sum = safe_float(receipt.get("excluded_sum", 0))
     total_sum += excluded_sum
 
-    logger.info(f"Add confirm: fiscal_doc={parsed_data.get('fiscal_doc', '')}, total_sum={total_sum:.2f}, user={callback.from_user.id}")
+    logger.info(f"Add confirm: fiscal_doc={receipt.get('fiscal_doc', '')}, total_sum={total_sum:.2f}, user={callback.from_user.id}")
 
     saved = await save_receipt(receipt, user_name=user_name)
 
@@ -496,7 +504,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             action="🆕 Добавлен чек",
             items=items_list,
             user_name=user_name,
-            fiscal_doc=parsed_data.get("fiscal_doc", ""),
+            fiscal_doc=receipt.get("fiscal_doc", ""),
             delivery_date=delivery_date_header,
             balance=balance,
             is_group=True
@@ -507,7 +515,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             action="🆕 Чек добавлен",
             items=items_list,
             user_name=user_name,
-            fiscal_doc=parsed_data.get("fiscal_doc", ""),
+            fiscal_doc=receipt.get("fiscal_doc", ""),
             delivery_date=delivery_date_header,
             balance=balance,
             is_group=False,
@@ -516,9 +524,9 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
 
         await loading_message.delete()
         await callback.message.answer(f"✅ Чек сохранён! Остаток: {balance:.2f} RUB")
-        logger.info(f"Чек добавлен: fiscal_doc={parsed_data.get('fiscal_doc', '')}, total={total_sum:.2f}, balance={balance}, user={user_name}")
+        logger.info(f"Чек добавлен: fiscal_doc={receipt.get('fiscal_doc', '')}, total={total_sum:.2f}, balance={balance}, user={user_name}")
     else:
-        await loading_message.edit_text(f"❌ Не удалось сохранить чек {parsed_data.get('fiscal_doc', '')}.")
+        await loading_message.edit_text(f"❌ Не удалось сохранить чек {receipt.get('fiscal_doc', '')}.")
 
     await state.clear()
 
@@ -598,15 +606,12 @@ async def add_manual_type(message: Message, state: FSMContext) -> None:
     await state.set_state(AddManualAPI.CONFIRM)
 
 @add_router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "confirm_manual_api")
-async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    loading = await callback.message.answer("⌛ Запрашиваю данные чека через API...")
+    loading = await callback.message.answer("⌛ Запрашиваю данные чека...")
 
     try:
-        success, msg, parsed_data = await asyncio.wait_for(
-            confirm_manual_api(data, callback.from_user),
-            timeout=10.0
-        )
+        success, msg, parsed_data = await confirm_manual_api(data, callback.from_user)
 
         if not success or not parsed_data:
             await loading.edit_text(msg)
@@ -623,24 +628,18 @@ async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext
         )
         await state.set_state(AddReceiptQR.CUSTOMER)
 
-        logger.info(
-            f"Manual API чек подтверждён: fiscal_doc={parsed_data['fiscal_doc']}, "
-            f"qr_string={parsed_data['qr_string']}, user_id={callback.from_user.id}"
-        )
+        logger.info(f"Manual API success: fiscal={parsed_data.get('fiscal_doc', 'N/A')}, user={callback.from_user.id}")
         await callback.answer()
 
-    except asyncio.TimeoutError:
-        await loading.edit_text(
-            "❌ Превышено время запроса к API. Попробуйте снова или добавьте чек вручную: /add_manual"
-        )
-        logger.error(f"Таймаут при запросе к API: user_id={callback.from_user.id}")
+    except asyncio.TimeoutError as timeout_exc:
+        await loading.edit_text("❌ Таймаут API. Попробуйте позже.")
+        logger.error(f"Timeout in handler: {str(timeout_exc)}")
         await state.clear()
         await callback.answer()
-    except Exception as e:
-        await loading.edit_text(
-            f"⚠️ Ошибка при запросе к API: {str(e)}. Проверьте /debug."
-        )
-        logger.error(f"Ошибка при запросе к API: {str(e)}, user_id={callback.from_user.id}")
+    except Exception as exc:
+        error_type = type(exc).__name__
+        await loading.edit_text(f"⚠️ Ошибка: {error_type}: {str(exc)}.")
+        logger.error(f"Handler error: {error_type}: {str(exc)}, user={callback.from_user.id}")
         await state.clear()
         await callback.answer()
 
