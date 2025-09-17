@@ -85,30 +85,39 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                     data_json = result.get("data", {}).get("json", {})
                     if data_json:
                         items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()
+                        excluded_items = get_excluded_items()  # Твоя функция? (или DEFAULT)
                         filtered_items = []
                         excluded_sum = 0.0
 
+                        # ✅ Raw totalSum (полная, до фильтра)
+                        total_sum_raw = safe_float(data_json.get("totalSum", 0)) / 100  # 2019.00
+                        if total_sum_raw == 0:
+                            # Fallback: sum всех items (если API не дал totalSum)
+                            total_sum_raw = sum(safe_float(it.get("sum", 0)) / 100 for it in items)
+                            logger.warning(f"Fallback total_sum_raw: {total_sum_raw:.2f} (totalSum был 0 в API)")
+
                         for item in items:
                             name = item.get("name", "Неизвестно").strip()
-                            total_sum = item.get("sum", 0) / 100
-                            unit_price = item.get("price", 0) / 100
+                            total_sum_item = safe_float(item.get("sum", 0)) / 100  # RUB
+                            unit_price = safe_float(item.get("price", 0)) / 100
                             quantity = item.get("quantity", 1)
 
                             if is_excluded(name):
-                                logger.info(f"Найден исключённый товар: '{name}' (сумма: {total_sum})")
-                                excluded_sum += total_sum
+                                logger.info(f"Найден исключённый товар: '{name}' (сумма: {total_sum_item})")
+                                excluded_sum += total_sum_item
                                 continue
 
                             filtered_items.append({
                                 "name": name,
-                                "sum": total_sum,
+                                "sum": total_sum_item,
                                 "price": unit_price,
                                 "quantity": quantity
                             })
 
-                        total_sum_raw = data_json.get("totalSum", 0) / 100
-                        filtered_total = total_sum_raw - excluded_sum  # Фикс: filtered total
+                        filtered_total = total_sum_raw - excluded_sum  # Для add.py (1922.85)
+
+                        # ✅ ЛОГ RAW/PARSED ДЛЯ DEBUG
+                        logger.info(f"QR parsed (API): totalSum_raw={total_sum_raw:.2f} (full), filtered_total={filtered_total:.2f}, excluded_sum={excluded_sum:.2f}, items_count={len(filtered_items)}, user_id={bot.id if bot else 'unknown'}")
 
                         return {
                             "fiscal_doc": data_json.get("fiscalDocumentNumber", "unknown"),
@@ -117,8 +126,9 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                             "items": filtered_items,
                             "qr_string": result.get("request", {}).get("qrraw", ""),
                             "operation_type": data_json.get("operationType", 1),
-                            "prepaid_sum": data_json.get("prepaidSum", 0) / 100,
-                            "total_sum": filtered_total,  # Исправлено: filtered
+                            "prepaid_sum": safe_float(data_json.get("prepaidSum", 0)) / 100,
+                            "total_sum": filtered_total,  # Для add.py (filtered, как раньше)
+                            "totalSum": total_sum_raw,  # ✅ НОВОЕ: Полная для return.py (full, 2019.00)
                             "excluded_sum": excluded_sum,
                             "excluded_items": [
                                 item.get("name") for item in items if is_excluded(item.get("name", "").strip())
@@ -135,6 +145,7 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
             else:
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
+            # ... (остальной код, если есть)
 
 async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str, Optional[Dict]]:
     """
