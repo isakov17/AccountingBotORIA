@@ -339,33 +339,3 @@ def start_notifications(bot: Bot):
         error_msg = str(e)
         logger.error(f"❌ Ошибка отправки тестового уведомления при запуске: {error_type}: {error_msg}, chat_id={GROUP_CHAT_ID}")
 
-# Тестовая команда
-@router.message(Command("test_group"))
-async def test_group_notification(message: Message, bot: Bot):
-    if not GROUP_CHAT_ID:
-        await message.answer("❌ GROUP_CHAT_ID не задан в конфигурации.")
-        logger.error("GROUP_CHAT_ID не задан")
-        return
-
-    test_message = "🔔 Тестовое уведомление в групповой чат!"
-    try:
-        logger.debug(f"Тест отправки в групповой чат, GROUP_CHAT_ID={GROUP_CHAT_ID}")
-        await bot.send_message(chat_id=GROUP_CHAT_ID, text=test_message)
-        logger.info(f"✅ Тестовое уведомление отправлено в групповой чат, chat_id={GROUP_CHAT_ID}")
-        await message.answer("✅ Тестовое уведомление отправлено в групповой чат.")
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        logger.error(f"❌ Ошибка отправки тестового уведомления: {error_type}: {error_msg}, chat_id={GROUP_CHAT_ID}")
-        await message.answer(f"❌ Ошибка отправки: {error_type}: {error_msg}")
-
-
-# Тестовая команда для получения ID чата
-@router.message(Command("getchatid"))
-async def get_chat_id(message: Message, bot: Bot):
-    chat_id = message.chat.id
-    chat_type = message.chat.type
-    chat_title = message.chat.title if chat_type in ["group", "supergroup"] else "Личный чат"
-    
-    response = f"📌 ID текущего чата: `{chat_id}`\n📋 Тип чата: {chat_type}\n🏷 Название: {chat_title}"
-    await message.answer(response, parse_mode="Markdown")
