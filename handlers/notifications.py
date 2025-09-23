@@ -280,19 +280,19 @@ async def send_notifications(bot: Bot):
         await asyncio.sleep(60)
 
 
-def start_notifications(bot: Bot):
-    # ✅ АКТИВНЫЙ ВАРИАНТ: ПРОДОВЫЙ — cron mon-fri 12:00 МСК (будние дни в 12:00)
-    trigger = CronTrigger(day_of_week="mon-fri", hour=12, minute=0, timezone="Europe/Moscow")
-    logger.info("🔔 Уведомления: будние 12:00 (прод режим)")
+# def start_notifications(bot: Bot):
+#     # ✅ АКТИВНЫЙ ВАРИАНТ: ПРОДОВЫЙ — cron mon-fri 12:00 МСК (будние дни в 12:00)
+#     trigger = CronTrigger(day_of_week="mon-fri", hour=12, minute=0, timezone="Europe/Moscow")
+#     logger.info("🔔 Уведомления: будние 12:00 (прод режим)")
     
-    scheduler.add_job(
-        send_notifications,
-        trigger=trigger,
-        args=[bot],
-        max_instances=1,
-    )
-    scheduler.start()
-    logger.info("🕐 Scheduler уведомлений запущен (прод режим)")
+#     scheduler.add_job(
+#         send_notifications,
+#         trigger=trigger,
+#         args=[bot],
+#         max_instances=1,
+#     )
+#     scheduler.start()
+#     logger.info("🕐 Scheduler уведомлений запущен (прод режим)")
 
     # ❌ ЗАКОММЕНТИРОВАННЫЙ ВАРИАНТ: ТЕСТОВЫЙ — каждую минуту (раскомментируй для разработки/тестирования)
     # trigger = IntervalTrigger(minutes=1)
@@ -306,3 +306,54 @@ def start_notifications(bot: Bot):
     # )
     # scheduler.start()
     # logger.info("🕐 Scheduler уведомлений запущен (тестовый режим)")
+
+    # Тестовая команда
+from aiogram import Router
+router = Router()
+
+def start_notifications(bot: Bot):
+    trigger = CronTrigger(day_of_week="mon-fri", hour=12, minute=0, timezone="Europe/Moscow")
+    logger.info("🔔 Уведомления: будние 12:00 (прод режим)")
+    
+    scheduler.add_job(
+        send_notifications,
+        trigger=trigger,
+        args=[bot],
+        max_instances=1,
+    )
+    scheduler.start()
+    logger.info("🕐 Scheduler уведомлений запущен (прод режим)")
+
+    # Тестовая отправка при запуске
+    test_message = "🔔 Тестовое уведомление при запуске бота!"
+    try:
+        logger.debug(f"Тест отправки при запуске, GROUP_CHAT_ID={GROUP_CHAT_ID}")
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id=GROUP_CHAT_ID, text=test_message),
+            asyncio.get_event_loop()
+        ).result(timeout=10)
+        logger.info(f"✅ Тестовое уведомление отправлено при запуске, chat_id={GROUP_CHAT_ID}")
+    except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e)
+        logger.error(f"❌ Ошибка отправки тестового уведомления при запуске: {error_type}: {error_msg}, chat_id={GROUP_CHAT_ID}")
+
+# Тестовая команда
+@router.message(Command("test_group"))
+async def test_group_notification(message: Message, bot: Bot):
+    if not GROUP_CHAT_ID:
+        await message.answer("❌ GROUP_CHAT_ID не задан в конфигурации.")
+        logger.error("GROUP_CHAT_ID не задан")
+        return
+
+    test_message = "🔔 Тестовое уведомление в групповой чат!"
+    try:
+        logger.debug(f"Тест отправки в групповой чат, GROUP_CHAT_ID={GROUP_CHAT_ID}")
+        await bot.send_message(chat_id=GROUP_CHAT_ID, text=test_message)
+        logger.info(f"✅ Тестовое уведомление отправлено в групповой чат, chat_id={GROUP_CHAT_ID}")
+        await message.answer("✅ Тестовое уведомление отправлено в групповой чат.")
+    except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e)
+        logger.error(f"❌ Ошибка отправки тестового уведомления: {error_type}: {error_msg}, chat_id={GROUP_CHAT_ID}")
+        await message.answer(f"❌ Ошибка отправки: {error_type}: {error_msg}")
