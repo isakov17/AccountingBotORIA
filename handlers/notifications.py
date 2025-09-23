@@ -1,6 +1,6 @@
 from aiogram import Bot
 from aiogram.filters import Command  # Добавлен импорт Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from googleapiclient.errors import HttpError
 from sheets import sheets_service, get_monthly_balance, async_sheets_call  # Async
 from config import SHEET_NAME, GROUP_CHAT_ID
