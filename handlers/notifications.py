@@ -1,4 +1,5 @@
 from aiogram import Bot
+from aiogram.filters import Command  # Добавлен импорт Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from googleapiclient.errors import HttpError
 from sheets import sheets_service, get_monthly_balance, async_sheets_call  # Async
