@@ -358,3 +358,14 @@ async def test_group_notification(message: Message, bot: Bot):
         error_msg = str(e)
         logger.error(f"❌ Ошибка отправки тестового уведомления: {error_type}: {error_msg}, chat_id={GROUP_CHAT_ID}")
         await message.answer(f"❌ Ошибка отправки: {error_type}: {error_msg}")
+
+
+# Тестовая команда для получения ID чата
+@router.message(Command("getchatid"))
+async def get_chat_id(message: Message, bot: Bot):
+    chat_id = message.chat.id
+    chat_type = message.chat.type
+    chat_title = message.chat.title if chat_type in ["group", "supergroup"] else "Личный чат"
+    
+    response = f"📌 ID текущего чата: `{chat_id}`\n📋 Тип чата: {chat_type}\n🏷 Название: {chat_title}"
+    await message.answer(response, parse_mode="Markdown")
