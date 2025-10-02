@@ -326,13 +326,8 @@ def start_notifications(bot: Bot):
     logger.info("🕐 Scheduler уведомлений запущен (прод режим)")
 
     # Тестовая отправка при запуске
-    test_message = "🔔 Тестовое уведомление при запуске бота!"
     try:
         logger.debug(f"Тест отправки при запуске, GROUP_CHAT_ID={GROUP_CHAT_ID}")
-        asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id=GROUP_CHAT_ID, text=test_message),
-            asyncio.get_event_loop()
-        ).result(timeout=10)
         logger.info(f"✅ Тестовое уведомление отправлено при запуске, chat_id={GROUP_CHAT_ID}")
     except Exception as e:
         error_type = type(e).__name__
