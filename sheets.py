@@ -19,6 +19,46 @@ creds = service_account.Credentials.from_service_account_info(
 )
 sheets_service = build('sheets', 'v4', credentials=creds)
 
+MONTHS_RU = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
+
+def get_archive_sheet_name(date_str: str) -> str:
+    """Формирует имя архивного листа по дате (ДД.ММ.ГГГГ)."""
+    try:
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        dt = datetime.now()
+    month_rus = MONTHS_RU[dt.month]
+    year = dt.year
+    return f"Архив Сводка {month_rus} {year}"
+
+
+def get_target_summary_sheet(date_str: str) -> str:
+    """Определяет, в какой лист писать: текущая 'Сводка' или архив."""
+    try:
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        dt = datetime.now()
+
+    current_month = datetime.now().strftime("%m.%Y")
+    purchase_month = dt.strftime("%m.%Y")
+
+    if purchase_month == current_month:
+        return "Сводка!A:E"
+    return f"{get_archive_sheet_name(date_str)}!A:E"
+
 async def async_sheets_call(method_callable, *args, **kwargs):
     loop = asyncio.get_event_loop()
     def make_call():
@@ -135,26 +175,24 @@ async def save_receipt(
         added_at = datetime.now().strftime("%d.%m.%Y")
 
         rows_checks = []
-        rows_summary = []  # Keep for data append (formulas sum C/D)
+        rows_summary = []  # Для сводки
 
         items = data.get("items", [])
         for i, item in enumerate(items):
             item_name = item.get("name", "Неизвестно")
-            item_sum = float(safe_float(item.get("sum", 0)))  # FIX: Pure float for summable
-            item_qty = float(item.get("quantity", 1)) or 1.0
+            item_sum = float(safe_float(item.get("sum", 0)))
+            item_qty = float(safe_float(item.get("quantity", 1))) or 1.0
             item_price = float(safe_float(item.get("price", 0))) or (item_sum / item_qty if item_qty else 0.0)
 
             item_link = (links[i] if i < len(links) else "") or item.get("link", "")
             item_comment = (comments[i] if i < len(comments) else "") or item.get("comment", "")
 
-            logger.debug(f"save_receipt: item[{i}] name={item_name}, sum={item_sum}")  # Minimal: no !r, debug
-
             row = [
                 added_at,  # A
                 date_for_sheet,  # B
-                item_sum,  # C: float (number)
-                item_price,  # D: float
-                item_qty,  # E: float
+                item_sum,  # C
+                item_price,  # D
+                item_qty,  # E
                 user_name,  # F
                 store,  # G
                 delivery_dates[i] if i < len(delivery_dates) else "",  # H
@@ -170,26 +208,25 @@ async def save_receipt(
             ]
             rows_checks.append(row)
 
-            # Summary data row (for formulas sum C/D; no fixed)
             rows_summary.append([
                 date_for_sheet,
                 "Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                0.0,  # C: float 0 (no income)
-                abs(item_sum),  # D: float expense
+                0.0,
+                abs(item_sum),
                 f"{fiscal_doc} - {item_name}"
             ])
 
-        excluded_sum = float(safe_float(data.get("excluded_sum", 0)))  # FIX: float
+        excluded_sum = float(safe_float(data.get("excluded_sum", 0)))
         if excluded_sum > 0:
             rows_summary.append([
                 date_for_sheet,
                 "Услуга",
-                0.0,  # C: 0
-                excluded_sum,  # D: float
+                0.0,
+                excluded_sum,
                 f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
             ])
 
-        # Append to Чеки (only)
+        # Чеки всегда в один лист
         await async_sheets_call(
             sheets_service.spreadsheets().values().append,
             spreadsheetId=SHEET_NAME,
@@ -199,19 +236,18 @@ async def save_receipt(
             body={"values": rows_checks}
         )
 
-        # Append summary data (for formulas; no updates)
+        # Сводка — в текущий или архивный лист
         if rows_summary:
+            target_sheet = get_target_summary_sheet(date_for_sheet)
             await async_sheets_call(
                 sheets_service.spreadsheets().values().append,
                 spreadsheetId=SHEET_NAME,
-                range="Сводка!A:E",
+                range=target_sheet,
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": rows_summary}
             )
-            logger.debug(f"Appended {len(rows_summary)} summary rows for formulas")
-
-        # REMOVED: All fixed updates (J1/M1/P1) — formulas handle
+            logger.debug(f"Appended {len(rows_summary)} summary rows to {target_sheet}")
 
         logger.info(f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, позиций={len(rows_checks)}, user={user_name}")
         return True
@@ -222,41 +258,38 @@ async def save_receipt(
 
 async def save_receipt_summary(date: str, operation_type: str, sum_value: float, note: str):
     """Append only data row for formulas (no fixed updates)."""
-    logger.debug(f"Summary append: {sum_value}, type: {operation_type}")  # Minimal
+    logger.debug(f"Summary append: {sum_value}, type: {operation_type}")
     try:
         formatted_date = normalize_date(date)
-        adjusted_value = float(abs(sum_value))  # FIX: float
+        adjusted_value = float(abs(sum_value))
 
         if operation_type == "Возврат":
-            income = adjusted_value  # C: float return
-            expense = 0.0  # D: 0
+            income, expense = adjusted_value, 0.0
         elif operation_type == "Услуга":
-            income = 0.0
-            expense = adjusted_value
-        else:  # Расход
-            income = 0.0
-            expense = adjusted_value
+            income, expense = 0.0, adjusted_value
+        else:
+            income, expense = 0.0, adjusted_value
 
-        # Append data row only (for formulas)
         summary_row = [
             formatted_date,
             operation_type,
-            income,  # C: float
-            expense,  # D: float
+            income,
+            expense,
             note
         ]
 
+        target_sheet = get_target_summary_sheet(formatted_date)
         await async_sheets_call(
             sheets_service.spreadsheets().values().append,
             spreadsheetId=SHEET_NAME,
-            range="Сводка!A:E",
+            range=target_sheet,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [summary_row]}
         )
 
-        logger.debug(f"Summary row appended: {summary_row[:2]}... (formulas will update)")
-        return True  # Success
+        logger.debug(f"Summary row appended to {target_sheet}: {summary_row[:2]}...")
+        return True
 
     except HttpError as e:
         logger.error(f"Ошибка append summary: {e.status_code} - {e.reason}")
