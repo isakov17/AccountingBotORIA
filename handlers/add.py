@@ -235,11 +235,13 @@ async def process_receipt_type(callback: CallbackQuery, state: FSMContext) -> No
         await state.update_data(receipt_type=receipt_type, delivery_dates=[], links=[], comments=[])
         if items:
             await callback.message.answer(
-                f"💬 Введите комментарий для «{items[0].get('name', '—')}» или /skip:",
+                f"📎 Пришлите ссылку на «{items[0].get('name', '—')}» "
+                f"(например: https://www.ozon.ru/...).",
                 reply_markup=reset_keyboard()
             )
             await state.update_data(current_item_index=0)
-            await state.set_state(AddReceiptQR.WAIT_COMMENT)
+            await state.set_state(AddReceiptQR.WAIT_LINK)
+
         # Удалено else: (no items already returned)
 
     elif callback.data == "type_delivery":
@@ -366,13 +368,17 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
     if current_item_index + 1 < len(items):
         next_index = current_item_index + 1
         await state.update_data(current_item_index=next_index)
+
         if receipt_type == "Полный":
+            # Сначала спрашиваем ссылку для следующего товара
             await message.answer(
-                f"💬 Введите комментарий для «{items[next_index].get('name', '—')}» или /skip:",
+                f"📎 Пришлите ссылку на «{items[next_index].get('name', '—')}» "
+                f"(например: https://www.ozon.ru/...).",
                 reply_markup=reset_keyboard()
             )
-            await state.set_state(AddReceiptQR.WAIT_COMMENT)
-        else:
+            await state.set_state(AddReceiptQR.WAIT_LINK)
+
+        else:  # Предоплата (доставка)
             await message.answer(
                 f"📅 Введите дату доставки для «{items[next_index].get('name', '—')}» "
                 f"(ддммгг, например 110825) или /skip:",
@@ -380,6 +386,7 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
             )
             await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         return
+
 
     # Все обработано
     total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
