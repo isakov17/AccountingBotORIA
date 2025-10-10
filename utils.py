@@ -122,7 +122,7 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                         return {
                             "fiscal_doc": data_json.get("fiscalDocumentNumber", "unknown"),
                             "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
-                            "store": data_json.get("retailPlace", "Неизвестно"),
+                            "store": data_json.get("user", "Неизвестно"),
                             "items": filtered_items,
                             "qr_string": result.get("request", {}).get("qrraw", ""),
                             "operation_type": data_json.get("operationType", 1),
@@ -258,7 +258,7 @@ async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str
                                             "fiscal_doc": data_json.get("fiscalDocumentNumber", f"{fn}-{fd}-{fp}"),
                                             "qr_string": result.get("request", {}).get("qrraw", f"t={t_combined}&s={sum_rub}&fn={fn}&i={fd}&fp={fp}&n={n_type}"),
                                             "date": data_json.get("ticketDate", full_date).replace("-", "."),
-                                            "store": data_json.get("retailPlace", data_json.get("user", "Неизвестно")),
+                                            "store": data_json.get("user", data_json.get("retailPlace", "Неизвестно")),
                                             "items": items if items else [{"name": "Товар из чека", "sum": s, "price": s, "quantity": 1}],  # Fallback
                                             "operation_type": data_json.get("operationType", op_type),
                                             "total_sum": filtered_total,
