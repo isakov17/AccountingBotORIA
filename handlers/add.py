@@ -463,35 +463,30 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
 
     data = await state.get_data()
     receipt: dict = data.get("receipt", {})
-    # parsed_data: dict = data.get("parsed_data", {})  # ❌ УДАЛИТЬ: больше не нужен
 
     user_name = await is_user_allowed(callback.from_user.id)
-
     if not user_name:
         await loading_message.edit_text("🚫 Доступ запрещен.")
         await state.clear()
         return
 
-    # Вычисляем total_sum (для лога, optional)
     items = receipt.get("items", [])
     total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
-    # ✅ ИЗМЕНЕНИЕ: Берем excluded_sum из receipt (теперь он там есть)
     excluded_sum = safe_float(receipt.get("excluded_sum", 0))
     total_sum += excluded_sum
 
-    logger.info(f"Add confirm: fiscal_doc={receipt.get('fiscal_doc', '')}, total_sum={total_sum:.2f}, user={callback.from_user.id}")
+    logger.info(f"✅ Подтверждение добавления чека: fiscal_doc={receipt.get('fiscal_doc', '')}, total_sum={total_sum:.2f}, user={user_name}")
 
     saved = await save_receipt(receipt, user_name=user_name)
 
     if saved:
-        # Force fetch реального баланса из таблицы (~0.3с, обновит кэш)
         balance_data = await get_monthly_balance(force_refresh=True)
         balance = balance_data.get("balance", 0.0) if balance_data else 0.0
 
         delivery_dates = receipt.get("delivery_dates", [])
-        delivery_date_header = delivery_dates[0] if delivery_dates else "Не указана"
+        delivery_date_header = delivery_dates[0] if delivery_dates else "—"
+        operation_date = datetime.now().strftime("%d.%m.%Y")
 
-        # Items для уведомлений
         items_list = []
         for i, item in enumerate(items):
             deliv_date = delivery_dates[i] if i < len(delivery_dates) else ""
@@ -505,35 +500,35 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
                 "delivery_date": deliv_date
             })
 
-        # Уведомления с реальным balance
+        # 🔔 Уведомление в группу
         await send_notification(
             bot=callback.bot,
-            action="🆕 Добавлен чек",
+            action="🧾 Добавлен новый чек",
             items=items_list,
             user_name=user_name,
             fiscal_doc=receipt.get("fiscal_doc", ""),
-            delivery_date=delivery_date_header,
+            operation_date=operation_date,
             balance=balance,
             is_group=True
         )
 
+        # 🔔 Личное уведомление пользователю
         await send_notification(
             bot=callback.bot,
-            action="🆕 Чек добавлен",
+            action="🧾 Чек успешно сохранён",
             items=items_list,
             user_name=user_name,
             fiscal_doc=receipt.get("fiscal_doc", ""),
-            delivery_date=delivery_date_header,
+            operation_date=operation_date,
             balance=balance,
             is_group=False,
             chat_id=callback.message.chat.id
         )
 
         await loading_message.delete()
-        await callback.message.answer(f"✅ Чек сохранён! Остаток: {balance:.2f} RUB")
-        logger.info(f"Чек добавлен: fiscal_doc={receipt.get('fiscal_doc', '')}, total={total_sum:.2f}, balance={balance}, user={user_name}")
+        await callback.message.answer(f"✅ Чек сохранён! Баланс: {balance:.2f} ₽")
     else:
-        await loading_message.edit_text(f"❌ Не удалось сохранить чек {receipt.get('fiscal_doc', '')}.")
+        await loading_message.edit_text(f"❌ Ошибка при сохранении чека {receipt.get('fiscal_doc', '')}.")
 
     await state.clear()
 

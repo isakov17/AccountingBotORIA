@@ -11,7 +11,6 @@ from sheets import (
     sheets_service,  # Если используется
     SHEET_NAME,  # Если используется
     get_monthly_balance,  # Для других частей, если нужно
-    # NOVOYE: Импорт delta helpers из sheets.py
     compute_delta_balance,
     update_balance_cache_with_delta,
     batch_update_sheets
@@ -254,10 +253,11 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot) -> None:
 
 @expenses_router.callback_query(ConfirmDelivery.CONFIRM_ACTION, F.data.in_(["confirm:delivery_many", "confirm:cancel"]))
 async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+
     if callback.data == "confirm:cancel":
-        await callback.message.edit_text("Отменено.")
+        await callback.message.edit_text("🚫 Доставка отменена.")
         await state.clear()
-        await callback.answer()
         return
 
     data = await state.get_data()
@@ -269,8 +269,8 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
     qr_str = parsed.get("qr_string", "")
 
     updates = []
-    ok, fail, errors = 0, 0, []
     updated_items = []
+    ok, fail, errors = 0, 0, []
 
     for it in sel_items:
         row_index = it["row_index"]
@@ -283,28 +283,21 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
             while len(row) < 17:
                 row.append("")
 
-            row[8] = "Доставлено"  # I=8
-            row[11] = "Полный"  # L=11
-            row[12] = str(new_fd)  # M=12
-            row[13] = qr_str  # N=13
+            row[8] = "Доставлено"
+            row[11] = "Полный"
+            row[12] = str(new_fd)
+            row[13] = qr_str
 
-            updates.append({
-                "range": f"Чеки!A{row_index}:Q{row_index}",
-                "values": [row]
-            })
+            updates.append({"range": f"Чеки!A{row_index}:Q{row_index}", "values": [row]})
 
-            link = row[15].strip() if len(row) > 15 else ""
-            comment = row[16].strip() if len(row) > 16 else ""
-            delivery_date = row[7].strip() if len(row) > 7 else ""
             updated_items.append({
                 "name": it.get("name", "—"),
                 "sum": safe_float(it.get("sum", 0)),
                 "quantity": int(it.get("quantity", 1) or 1),
-                "link": link,
-                "comment": comment,
-                "delivery_date": delivery_date
+                "link": (row[15] or "").strip() if len(row) > 15 else "",
+                "comment": (row[16] or "").strip() if len(row) > 16 else "",
+                "delivery_date": (row[7] or "").strip() if len(row) > 7 else ""
             })
-
             ok += 1
         except Exception as e:
             fail += 1
@@ -313,12 +306,11 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
     if updates:
         await batch_update_sheets(updates)
 
-    # Force fetch баланса (~0.3с)
     balance_data = await get_monthly_balance(force_refresh=True)
     balance = balance_data.get("balance", 0.0) if balance_data else 0.0
 
     user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
-    delivery_date_header = updated_items[0].get("delivery_date", datetime.now().strftime("%d.%m.%Y")) if updated_items else datetime.now().strftime("%d.%m.%Y")
+    operation_date = datetime.now().strftime("%d.%m.%Y")
 
     if fail == 0:
         await send_notification(
@@ -327,27 +319,24 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
             items=updated_items,
             user_name=user_name,
             fiscal_doc=new_fd,
-            delivery_date=delivery_date_header,
+            operation_date=operation_date,
             balance=balance,
             is_group=True
         )
-
         await send_notification(
             bot=callback.bot,
             action="📦 Доставка подтверждена",
             items=updated_items,
             user_name=user_name,
             fiscal_doc=new_fd,
-            delivery_date=delivery_date_header,
+            operation_date=operation_date,
             balance=balance,
             is_group=False,
             chat_id=callback.message.chat.id
         )
-        await callback.message.edit_text(f"✅ Доставка подтверждена ({ok} позиций). Остаток: {balance:.2f} RUB")
+        await callback.message.edit_text(f"✅ Доставка подтверждена ({ok} позиций). Баланс: {balance:.2f} ₽")
     else:
         details = "\n".join(errors[:5])
-        await callback.message.edit_text(f"⚠️ Частично: {ok} ок, {fail} ошибок.\n{details}\nОстаток: {balance:.2f} RUB")
+        await callback.message.edit_text(f"⚠️ Частично: {ok} ок, {fail} ошибок.\n{details}\nБаланс: {balance:.2f} ₽")
 
-    logger.info(f"Delivery confirmed: fiscal={new_fd}, ok={ok}, fail={fail}, balance={balance}, user={callback.from_user.id}")
     await state.clear()
-    await callback.answer()

@@ -288,6 +288,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
 
 @return_router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
     data = await state.get_data()
     fiscal_doc = data.get("fiscal_doc")
     new_fiscal_doc = data.get("new_fiscal_doc")
@@ -297,137 +299,95 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
     date_purchase = data.get("date_purchase", "—")
 
     if callback.data == "cancel_return":
-        await callback.message.edit_text(f"Возврат {item_name} отменён. QR не сохранён.")  # Нет reply_markup (None по умолчанию)
-        logger.info(f"Возврат отменён: old_fiscal={fiscal_doc}, new_fiscal={new_fiscal_doc}, item={item_name}, user_id={callback.from_user.id}")
+        await callback.message.edit_text(f"🚫 Возврат {item_name} отменён.")
         await state.clear()
-        await callback.answer()
         return
 
-    if callback.data == "confirm_return":
-        row_updated = False
-        updated_items = []
-        errors = []
+    try:
+        result = await async_sheets_call(
+            sheets_service.spreadsheets().values().get,
+            spreadsheetId=SHEET_NAME,
+            range="Чеки!A:Q"
+        )
+        rows = result.get("values", [])[1:]
+        updated_items, found = [], False
 
-        try:
-            # Get данных для обновления строки
-            result = await async_sheets_call(
-                sheets_service.spreadsheets().values().get,
-                spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
+        for i, row in enumerate(rows, start=2):
+            if len(row) < 13:
+                continue
+            if str(row[12] or "").strip() == fiscal_doc and (row[10] or "").strip() == item_name:
+                while len(row) < 17:
+                    row.append("")
+                row[8] = "Возвращен"
+                row[14] = parsed_data.get("qr_string", "")
+                await async_sheets_call(
+                    sheets_service.spreadsheets().values().update,
+                    spreadsheetId=SHEET_NAME,
+                    range=f"Чеки!A{i}:Q{i}",
+                    valueInputOption="RAW",
+                    body={"values": [row]}
+                )
+
+                updated_items.append({
+                    "name": item_name,
+                    "sum": safe_float(row[2]),
+                    "quantity": int(row[4] or 1),
+                    "price": safe_float(row[3]) if row[3] else safe_float(row[2]) / int(row[4] or 1),
+                    "link": (row[15] or "").strip() if len(row) > 15 else "",
+                    "comment": (row[16] or "").strip() if len(row) > 16 else "",
+                    "delivery_date": (row[7] or "").strip() if len(row) > 7 else ""
+                })
+
+                await save_receipt_summary(
+                    parsed_data.get("date", datetime.now().strftime("%d.%m.%Y")),
+                    "Возврат",
+                    total_return_sum,
+                    f"{new_fiscal_doc} - {item_name}"
+                )
+                found = True
+                break
+
+        balance_data = await get_monthly_balance(force_refresh=True)
+        balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
+        user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
+        operation_date = datetime.now().strftime("%d.%m.%Y")
+
+        if found:
+            await send_notification(
+                bot=callback.bot,
+                action=f"↩️ Возврат подтверждён ({total_return_sum:.2f} ₽)",
+                items=updated_items,
+                user_name=user_name,
+                fiscal_doc=new_fiscal_doc,
+                operation_date=operation_date,
+                balance=balance,
+                is_group=True
             )
-            rows = result.get("values", [])[1:]  # Skip header
-            logger.info(f"Подтверждение возврата: загружено {len(rows)} строк из Чеки!A:Q")
-
-            for i, row in enumerate(rows, start=2):
-                if len(row) < 13:
-                    continue
-                if str(row[12] or "").strip() == fiscal_doc and (row[10] or "").strip() == item_name:
-                    # Обновляем только status и qr_string (оригинал C=2 остаётся)
-                    while len(row) < 17:
-                        row.append("")
-                    row[8] = "Возвращен"  # I=8
-                    row[14] = parsed_data.get("qr_string", "")  # O=14
-
-                    await async_sheets_call(
-                        sheets_service.spreadsheets().values().update,
-                        spreadsheetId=SHEET_NAME,
-                        range=f"Чеки!A{i}:Q{i}",
-                        valueInputOption="RAW",
-                        body={"values": [row]}
-                    )
-                    row_updated = True
-
-                    # Original данные для уведомлений (история)
-                    original_sum = safe_float(row[2]) if row[2] else 0.0
-                    qty = int(row[4] or 1)
-                    link = (row[15] or "").strip() if len(row) > 15 else ""
-                    comment = (row[16] or "").strip() if len(row) > 16 else ""
-                    delivery_date = (row[7] or "").strip() if len(row) > 7 else ""
-
-                    updated_items.append({
-                        "name": item_name,
-                        "sum": original_sum,  # Original для деталей
-                        "quantity": qty,
-                        "price": safe_float(row[3]) if len(row) > 3 and row[3] else original_sum / qty,
-                        "link": link,
-                        "comment": comment,
-                        "delivery_date": delivery_date
-                    })
-
-                    # ✅ Сводка: Полная сумма из QR (возврат как доход)
-                    await save_receipt_summary(
-                        parsed_data.get("date", datetime.now().strftime("%d.%m.%Y")),
-                        "Возврат",
-                        total_return_sum,  # Полная из QR
-                        f"{new_fiscal_doc} - {item_name}"
-                    )
-
-                    logger.info(f"Строка обновлена в Чеки: row={i}, old_fiscal={fiscal_doc}, new_qr={new_fiscal_doc}, original_sum={original_sum}, qr_total={total_return_sum}")
-                    break
-                else:
-                    errors.append(f"Строка {i}: Несовпадение (fiscal/item)")
-
-            if row_updated:
-                # Force refresh баланса
-                balance_data = await get_monthly_balance(force_refresh=True)
-                balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
-
-                user_name = await is_user_allowed(callback.from_user.id) or callback.from_user.full_name
-                delivery_date_header = updated_items[0].get("delivery_date", date_purchase) if updated_items else date_purchase
-
-                # Уведомления: Детали original, но сумма из QR
-                await send_notification(
-                    bot=callback.bot,
-                    action=f"↩️ Возврат подтверждён ({total_return_sum:.2f} RUB)",
-                    items=updated_items,
-                    user_name=user_name,
-                    fiscal_doc=new_fiscal_doc,
-                    delivery_date=delivery_date_header,
-                    balance=balance,
-                    is_group=True
-                )
-
-                await send_notification(
-                    bot=callback.bot,
-                    action=f"↩️ Возврат подтверждён ({total_return_sum:.2f} RUB)",
-                    items=updated_items,
-                    user_name=user_name,
-                    fiscal_doc=new_fiscal_doc,
-                    delivery_date=delivery_date_header,
-                    balance=balance,
-                    is_group=False,
-                    chat_id=callback.message.chat.id
-                )
-
-                await callback.message.edit_text(
-                    f"✅ Возврат {item_name} подтверждён.\n"
-                    f"• Новый fiscal: {new_fiscal_doc}\n"
-                    f"• Сумма возврата: {total_return_sum:.2f} RUB (полная из QR)\n"
-                    f"• Оригинальная сумма товара: {updated_items[0]['sum']:.2f} RUB\n"
-                    f"🟰 Остаток: {balance:.2f} RUB"
-                )  # Нет reply_markup (None)
-                logger.info(f"Возврат подтверждён: old_fiscal={fiscal_doc}, new_fiscal={new_fiscal_doc}, item={item_name}, qr_total={total_return_sum}, original_sum={updated_items[0]['sum'] if updated_items else 0}, balance={balance}, user_id={callback.from_user.id}")
-
-            else:
-                balance_data = await get_monthly_balance(force_refresh=True)
-                balance = safe_float(balance_data.get("balance", 0.0)) if balance_data else 0.0
-                details = "\n".join(errors[:5])
-                more = f"\n…и ещё {len(errors)-5}" if len(errors) > 5 else ""
-                await callback.message.edit_text(
-                    f"⚠️ Ошибка: Строка не обновлена ({len(errors)} проблем).\n"
-                    f"{details}{more}\n"
-                    f"🟰 Остаток: {balance:.2f} RUB (QR не сохранён)"
-                )  # Нет reply_markup (None)
-                logger.error(f"Строка не найдена для возврата: fiscal={fiscal_doc}, item={item_name}, errors={len(errors)}, user_id={callback.from_user.id}")
-
-        except HttpError as e:
-            await callback.message.edit_text(f"Ошибка обновления в Google Sheets: {e.status_code} - {e.reason}. Проверьте /debug.")  # Нет reply_markup
-            logger.error(f"HttpError подтверждения возврата: {e.status_code} - {e.reason}, user_id={callback.from_user.id}")
-        except Exception as e:
-            await callback.message.edit_text(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.")  # Нет reply_markup
-            logger.error(f"Ошибка подтверждения возврата: {str(e)}, user_id={callback.from_user.id}")
+            await send_notification(
+                bot=callback.bot,
+                action=f"↩️ Возврат подтверждён ({total_return_sum:.2f} ₽)",
+                items=updated_items,
+                user_name=user_name,
+                fiscal_doc=new_fiscal_doc,
+                operation_date=operation_date,
+                balance=balance,
+                is_group=False,
+                chat_id=callback.message.chat.id
+            )
+            await callback.message.edit_text(
+                f"✅ Возврат {item_name} подтверждён.\n"
+                f"Фискальный номер: {new_fiscal_doc}\n"
+                f"Сумма: {total_return_sum:.2f} ₽\n"
+                f"Баланс: {balance:.2f} ₽"
+            )
+        else:
+            await callback.message.edit_text(f"⚠️ Не удалось найти товар {item_name} для обновления.")
+    except HttpError as e:
+        await callback.message.edit_text(f"Ошибка Google Sheets: {e.status_code} - {e.reason}")
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка подтверждения возврата: {e}")
 
     await state.clear()
-    await callback.answer()
 
 # Отмена ("Сброс")
 @return_router.message(F.text == "Сброс", ReturnReceipt)
