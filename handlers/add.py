@@ -16,14 +16,23 @@ from sheets import (
     update_balance_cache_with_delta
 )
 
-from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date
+from config import REDIS_RETRY_PREFIX
+
+# // Added: Imports from utils for cache/redis
+from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date, cache_set
+
+# // Added: For tasks (if not separate file, but assume tasks.py exists)
+from tasks import retry_check_task
+
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 import logging
 import asyncio
 from datetime import datetime
+import time
 import re
 import calendar
+import base64  # // Added: For base64 encoding bytes in Redis
 
 
 logger = logging.getLogger("AccountingBot")
@@ -69,17 +78,36 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
             timeout=10.0
         )
 
-        if not parsed_data:
-            inline_keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="goto_add_manual")]]
-            )
-            await loading.edit_text(
-                "❌ QR-код не удалось распознать. Возможно, превышено количество обращений по чеку.\n"
-                "Вы можете попробовать снова или добавить чек вручную:",
-                reply_markup=inline_keyboard
-            )
-            logger.error(f"Не удалось распознать QR-код: user_id={message.from_user.id}")
+        if parsed_data is None:  # Code=2: Запустить retry
+            file = await bot.get_file(message.photo[-1].file_id)
+            file_path = file.file_path
+            photo_bytes = await bot.download_file(file_path)  # BytesIO
+            # Compute hash for dedup (sha256 of bytes)
+            photo_hash = hashlib.sha256(photo_bytes.getvalue()).hexdigest()[:16]  # Short hash for key
+            retry_key = f"{REDIS_RETRY_PREFIX}{message.from_user.id}:{photo_hash}"  # Unique by user + content hash (dedup identical photos)
+            # Check if already exists (dedup)
+            existing = await cache_get(retry_key)
+            if existing:
+                await loading.edit_text("⏳ Этот чек уже в очереди на проверку. Ждите уведомления!")
+                await state.clear()
+                logger.info(f"Duplicate retry skipped: key={retry_key}, user_id={message.from_user.id}")
+                return
+            
+            # Save retry task with photo hash for tracking
+            retry_data = {
+                "params": {"qrfile": base64.b64encode(photo_bytes.getvalue()).decode('utf-8')},  # str base64
+                "user_id": message.from_user.id,
+                "chat_id": message.chat.id,
+                "attempts": 0,
+                "last_attempt": time.time(),
+                "message_id": loading.message_id,
+                "photo_hash": photo_hash  # Add hash for tracking
+            }
+            await cache_set(retry_key, retry_data, expire=86400 * 2)
+            asyncio.create_task(retry_check_task(retry_key, bot))
+            await loading.edit_text("⏳ Чек не в базе ФНС. Проверю каждый час (до 24 ч). Уведомлю при появлении!")
             await state.clear()
+            logger.info(f"Started retry for QR photo: key={retry_key}, user_id={message.from_user.id}")
             return
 
         if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
@@ -126,9 +154,10 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
         logger.error(f"Ошибка обработки фото чека: {str(e)}, user_id={message.from_user.id}")
         await state.clear()
 
+
 @add_router.callback_query(lambda c: c.data == "goto_add_manual")
 async def goto_add_manual(callback: CallbackQuery, state: FSMContext) -> None:
-    user_id = callback.from_user.id  # Правильный user ID (1059161513)
+    user_id = callback.from_user.id
     
     # Проверка доступа перед вызовом (fallback)
     if not await is_user_allowed(user_id):
@@ -615,11 +644,74 @@ async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext
     try:
         success, msg, parsed_data = await confirm_manual_api(data, callback.from_user)
 
-        if not success or not parsed_data:
-            await loading.edit_text(msg)
-            await state.clear()
-            await callback.answer()
-            return
+        if not success:
+            if "не готовы" in msg:  # Code=2
+                # Calculate t_combined for manual retry
+                date_str = data.get('date', '').strip()
+                time_str = data.get('time', '').strip()
+                
+                # Format date: ддммгг → YYYYMMDD
+                if len(date_str) == 6:
+                    day, month, year = date_str[:2].zfill(2), date_str[2:4].zfill(2), f"20{date_str[4:6]}"
+                    full_date = f"{year}{month}{day}"
+                else:
+                    try:
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+                        full_date = dt.strftime("%Y%m%d")
+                    except ValueError:
+                        full_date = datetime.now().strftime("%Y%m%d")
+
+                # Time: ЧЧ:ММ → HHMM
+                if ':' in time_str:
+                    full_time = time_str.replace(":", "")
+                elif len(time_str) == 4:
+                    full_time = time_str
+                else:
+                    full_time = datetime.now().strftime("%H%M")
+
+                t_combined = f"{full_date}T{full_time}"
+
+                # Запустить retry для manual
+                retry_key = f"{REDIS_RETRY_PREFIX}{callback.from_user.id}:{data.get('fd', 'manual')}"
+                
+                # Check if already exists (dedup)
+                existing = await cache_get(retry_key)
+                if existing:
+                    await loading.edit_text("⏳ Этот чек уже в очереди на проверку. Ждите уведомления!")
+                    await state.clear()
+                    await callback.answer()
+                    logger.info(f"Duplicate manual retry skipped: key={retry_key}, user_id={callback.from_user.id}")
+                    return
+                
+                retry_data = {
+                    "params": {
+                        "fn": data.get('fn'),
+                        "fd": data.get('fd'),
+                        "fp": data.get('fp'),
+                        "t": t_combined,
+                        "n": str(data.get('op_type', 1)),
+                        "s": f"{data.get('s', 0):.2f}",
+                        "qr": "0"
+                    },
+                    "user_id": callback.from_user.id,
+                    "chat_id": callback.message.chat.id,
+                    "attempts": 0,
+                    "last_attempt": time.time(),
+                    "message_id": loading.message_id,
+                    "is_manual": True  # Mark as manual for tracking
+                }
+                await cache_set(retry_key, retry_data, expire=86400 * 2)
+                asyncio.create_task(retry_check_task(retry_key, callback.bot))
+                await loading.edit_text(msg + " Проверю каждый час. Уведомлю!")
+                await state.clear()
+                await callback.answer()
+                logger.info(f"Started retry for manual: key={retry_key}, user_id={callback.from_user.id}")
+                return
+            else:
+                await loading.edit_text(msg)
+                await state.clear()
+                await callback.answer()
+                return
 
         await loading.edit_text("✅ Чек получен.")
         await callback.message.answer("Введите заказчика (или /skip):", reply_markup=reset_keyboard())
@@ -644,6 +736,50 @@ async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext
         logger.error(f"Handler error: {error_type}: {str(exc)}, user={callback.from_user.id}")
         await state.clear()
         await callback.answer()
+
+@add_router.callback_query(lambda c: c.data.startswith("continue_add:"))
+async def continue_add(callback: CallbackQuery, state: FSMContext) -> None:
+    """Продолжение добавления чека после успешной фоновой проверки"""
+    try:
+        fd = callback.data.split(":")[1]
+        success_key = f"check_success:{callback.from_user.id}:{fd}"
+        parsed_data = await cache_get(success_key)
+        
+        if not parsed_data:
+            await callback.message.answer("❌ Данные чека устарели. Добавьте заново.")
+            await callback.answer()
+            return
+
+        await state.update_data(
+            username=callback.from_user.username or str(callback.from_user.id),
+            parsed_data=parsed_data
+        )
+        await state.set_state(AddReceiptQR.CUSTOMER)
+        
+        await callback.message.answer(
+            "🎉 Продолжаем добавление чека! Введите заказчика (или /skip):", 
+            reply_markup=reset_keyboard()
+        )
+        
+        # Удаляем временные данные
+        await cache_set(success_key, None, expire=1)
+        
+        await callback.answer("Продолжение запущено!")
+        logger.info(f"Continued add from retry: fd={fd}, user_id={callback.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Error in continue_add: {str(e)}")
+        await callback.message.answer("❌ Ошибка при продолжении добавления чека")
+        await callback.answer()
+
+@add_router.callback_query(lambda c: c.data == "retry_failed_check")
+async def retry_failed_check(callback: CallbackQuery) -> None:
+    """Повторная попытка после неудачной фоновой проверки"""
+    await callback.message.answer(
+        "🔄 Для повторной проверки чека отправьте фото QR-кода заново или используйте /add_manual",
+        reply_markup=reset_keyboard()
+    )
+    await callback.answer("Можете попробовать снова")
 
 @add_router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "cancel_manual_api")
 async def cancel_manual_api_callback(callback: CallbackQuery, state: FSMContext) -> None:

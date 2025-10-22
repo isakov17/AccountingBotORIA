@@ -1,7 +1,7 @@
 from exceptions import is_excluded, get_excluded_items
 import logging
 import aiohttp
-from config import PROVERKACHEKA_TOKEN
+from config import PROVERKACHEKA_TOKEN, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_MAX_CONNECTIONS, DEBUG_SIMULATE_CODE2
 import redis.asyncio as redis
 import json
 from datetime import datetime
@@ -15,7 +15,14 @@ from io import BytesIO
 logger = logging.getLogger("AccountingBot")
 
 # Redis с pool и reconnect
-pool = redis.ConnectionPool(host='localhost', port=6379, db=0, decode_responses=True, max_connections=10, retry_on_timeout=True)
+pool = redis.ConnectionPool(
+    host=REDIS_HOST, 
+    port=REDIS_PORT, 
+    db=REDIS_DB, 
+    decode_responses=True, 
+    max_connections=REDIS_MAX_CONNECTIONS, 
+    retry_on_timeout=True
+)
 redis_client = redis.Redis(connection_pool=pool)
 
 async def cache_get(key: str) -> any:
@@ -81,11 +88,18 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
         async with session.post("https://proverkacheka.com/api/v1/check/get", data=form) as response:
             if response.status == 200:
                 result = await response.json()
-                if result.get("code") == 1:
+                code = result.get("code")
+
+                # Debug simulation for testing
+                if DEBUG_SIMULATE_CODE2:
+                    logger.debug("Simulating code=2 for test in parse_qr_from_photo")
+                    return None
+
+                if code == 1:
                     data_json = result.get("data", {}).get("json", {})
                     if data_json:
                         items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()  # Твоя функция? (или DEFAULT)
+                        excluded_items = get_excluded_items()
                         filtered_items = []
                         excluded_sum = 0.0
 
@@ -137,6 +151,9 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                     else:
                         logger.error("Нет данных JSON в ответе от proverkacheka.com")
                         return None
+                elif code == 2:
+                    # Возвращаем None для хендлера, который запустит task
+                    return None
                 else:
                     logger.error(
                         f"Ошибка обработки на proverkacheka.com: code={result.get('code')}, message={result.get('data')}"
@@ -145,7 +162,6 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
             else:
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
-            # ... (остальной код, если есть)
 
 async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str, Optional[Dict]]:
     """
@@ -218,6 +234,11 @@ async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str
                         response_text = await response.text()
                         logger.info(f"API response: status={response.status}, text={response_text[:200]}...")
 
+                        # Debug simulation for testing
+                        if DEBUG_SIMULATE_CODE2:
+                            logger.debug("Simulating code=2 for test in confirm_manual_api")
+                            return False, "⏳ Simulated code=2 for test. Запускаю фоновую проверку каждый час.", None
+
                         if response.status == 200:
                             try:
                                 result = json.loads(response_text)
@@ -277,7 +298,7 @@ async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str
                                         logger.error("Нет data.json в ответе")
                                         return False, "❌ Нет данных чека в ответе API.", None
                                 elif code == 2:
-                                    return False, "⏳ Данные чека пока не готовы. Попробуйте позже.", None
+                                    return False, "⏳ Данные чека пока не готовы. Запускаю фоновую проверку каждый час.", None
                                 elif code == 3:
                                     if attempt < max_retries:
                                         logger.warning("Rate limit (code=3). Retry через 60s.")
@@ -359,7 +380,6 @@ def reset_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="Сброс")]],
         resize_keyboard=True
     )
-
 
 def norm(s: str) -> str:
     """
