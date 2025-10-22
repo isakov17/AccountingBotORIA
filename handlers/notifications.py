@@ -75,7 +75,7 @@ async def send_notification(
         if is_group:
             reply_markup = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🚀 Открыть бота", url="https://t.me/TESTAccountingORIABot")]
+                    [InlineKeyboardButton(text="🚀 Открыть бота", url="https://t.me/AccountingORIABot")]
                 ]
             )
 
