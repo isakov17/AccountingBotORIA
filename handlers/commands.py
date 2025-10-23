@@ -2,14 +2,14 @@ from aiogram import Router, Bot, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
-from sheets import sheets_service, is_user_allowed, async_sheets_call, get_monthly_balance  # + get_monthly_balance
+from sheets import sheets_service, is_user_allowed, async_sheets_call, get_monthly_balance, is_fiscal_doc_unique  # + get_monthly_balance
 from config import SHEET_NAME, PROVERKACHEKA_TOKEN, YOUR_ADMIN_ID, SPREADSHEETS_LINK
 from exceptions import (
     get_excluded_items,
     add_excluded_item,
     remove_excluded_item
 )
-from utils import redis_client
+from utils import redis_client, safe_float
 from googleapiclient.errors import HttpError
 import logging
 import aiohttp
@@ -545,3 +545,69 @@ async def get_chat_id(message: Message, bot: Bot):
     
     response = f"📌 ID текущего чата: `{chat_id}`\n📋 Тип чата: {chat_type}\n🏷 Название: {chat_title}"
     await message.answer(response, parse_mode="Markdown")
+
+# 🚨 ДОБАВИТЬ В commands.py:
+
+@router.message(Command("pending_stats"))
+async def show_pending_stats(message: Message):
+    """Показать статистику pending задач (только для админов)"""
+    if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
+        await message.answer("🚫 Доступ запрещен. Только администратор.")
+        logger.info(f"Доступ запрещен для /pending_stats: user_id={message.from_user.id}")
+        return
+        
+    try:
+        from utils import get_pending_stats  # Импорт функции
+        
+        stats = await get_pending_stats()
+        
+        text = (
+            "📊 Статистика pending задач:\n"
+            f"• Всего задач: {stats['total']}\n"
+            "• По типам:\n"
+        )
+        
+        for check_type, count in stats['by_type'].items():
+            text += f"  - {check_type}: {count}\n"
+            
+        if stats['old_tasks']:
+            text += f"\n⚠️ Старых задач (>1ч): {len(stats['old_tasks'])}\n"
+            for task in stats['old_tasks'][:5]:  # Показываем первые 5
+                text += f"  - {task['key']}: {task['age_hours']:.1f}ч, {task['retries']} попыток\n"
+            if len(stats['old_tasks']) > 5:
+                text += f"  ... и еще {len(stats['old_tasks']) - 5}\n"
+        else:
+            text += "\n✅ Нет старых задач"
+            
+        await message.answer(text)
+        logger.info(f"Статистика pending показана: total={stats['total']}, user_id={message.from_user.id}")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения статистики: {str(e)}")
+        logger.error(f"Ошибка /pending_stats: {str(e)}, user_id={message.from_user.id}")
+
+@router.message(Command("cleanup_old_tasks"))
+async def cleanup_old_tasks_command(message: Message):
+    """Очистка устаревших pending задач (только для админов)"""
+    if not await is_user_allowed(message.from_user.id) or message.from_user.id != YOUR_ADMIN_ID:
+        await message.answer("🚫 Доступ запрещен. Только администратор.")
+        logger.info(f"Доступ запрещен для /cleanup_old_tasks: user_id={message.from_user.id}")
+        return
+        
+    try:
+        from utils import get_pending_stats, remove_pending
+        
+        stats = await get_pending_stats()
+        cleaned = 0
+        
+        for task in stats['old_tasks']:
+            fiscal_key = task['key'].replace("pending:", "")
+            await remove_pending(fiscal_key)
+            cleaned += 1
+            
+        await message.answer(f"✅ Очищено {cleaned} старых задач из {len(stats['old_tasks'])}")
+        logger.info(f"Очищено старых задач: {cleaned}, user_id={message.from_user.id}")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка очистки: {str(e)}")
+        logger.error(f"Ошибка /cleanup_old_tasks: {str(e)}, user_id={message.from_user.id}")

@@ -12,12 +12,19 @@ import requests  # Для API запросов (fallback)
 import time  # Для time.sleep в retry
 from io import BytesIO
 from aiogram import Bot  # Для уведомлений в retry
+from datetime import timezone
 
 logger = logging.getLogger("AccountingBot")
 
 # Redis с pool и reconnect
 pool = redis.ConnectionPool(host='localhost', port=6379, db=0, decode_responses=True, max_connections=10, retry_on_timeout=True)
 redis_client = redis.Redis(connection_pool=pool)
+
+import asyncio
+from datetime import datetime, timedelta
+
+
+
 
 async def cache_get(key: str) -> any:
     try:
@@ -39,29 +46,36 @@ async def cache_set(key: str, value: any, expire: int = None) -> bool:
         logger.error(f"Ошибка записи в Redis: {str(e)}")
         return False
 
-# НОВОЕ: Функции для pending checks
+# НОВЫЕ: Функции для pending checks с правильной структурой
 async def is_pending_or_processed(fiscal_key: str) -> bool:
     """Проверяет, в обработке ли чек или уже сохранён."""
-    processed = await redis_client.sismember("processed_fiscals", fiscal_key)
-    pending = await redis_client.hexists("pending_checks", fiscal_key)
+    processed = await redis_client.exists(f"processed:{fiscal_key}")
+    pending = await redis_client.exists(f"pending:{fiscal_key}")
     return processed or pending
 
 async def add_to_pending(fiscal_key: str, data: dict, expire: int = 3600) -> bool:
-    """Добавляет в pending с expire (1 час)."""
+    """Добавляет в pending с expire."""
     data['retries'] = 0
-    await redis_client.hset("pending_checks", fiscal_key, json.dumps(data))
-    await redis_client.expire("pending_checks", expire)  # Общий expire для hash
-    return True
+    data['created_at'] = time.time()
+    return await cache_set(f"pending:{fiscal_key}", data, expire=expire)
 
 async def get_pending(fiscal_key: str) -> dict | None:
-    data = await redis_client.hget("pending_checks", fiscal_key)
-    return json.loads(data) if data else None
+    return await cache_get(f"pending:{fiscal_key}")
+
+async def update_pending(fiscal_key: str, data: dict):
+    """Обновляет данные pending задачи"""
+    current = await get_pending(fiscal_key)
+    if current:
+        # Сохраняем TTL существующей задачи
+        ttl = await redis_client.ttl(f"pending:{fiscal_key}")
+        await cache_set(f"pending:{fiscal_key}", data, expire=ttl)
 
 async def remove_pending(fiscal_key: str):
-    await redis_client.hdel("pending_checks", fiscal_key)
+    await redis_client.delete(f"pending:{fiscal_key}")
 
 async def add_to_processed(fiscal_key: str):
-    await redis_client.sadd("processed_fiscals", fiscal_key)
+    await cache_set(f"processed:{fiscal_key}", {"processed_at": time.time()}, expire=86400)
+
 
 def normalize_date(date_str: str) -> str:
     """
@@ -94,34 +108,14 @@ def safe_float(value: str | float | int, default: float = 0.0) -> float:
     return default
 
 # Тестовые константы (включить/выключить)
-TEST_MODE = True  # Если True, всегда симулирует code=2 для любой фото/ручного ввода
 PROD_RETRY_INTERVAL_MIN = 60  # Прод: 60 мин (1 час)
 PROD_MAX_RETRIES = 12  # Прод: 12 попыток (12 часов)
-TEST_RETRY_INTERVAL_MIN = 1  # Тест: 1 минута
-TEST_MAX_RETRIES = 3  # Тест: 3 попытки, успех на 3-й
 
-async def parse_qr_from_photo(bot, file_id) -> dict | None:
+async def parse_qr_from_photo(bot, file_id, user_id=None, chat_id=None) -> dict | None:
     file = await bot.get_file(file_id)
     file_path = file.file_path
     photo = await bot.download_file(file_path)
     
-    if TEST_MODE:
-        # Симуляция code=2 для теста
-        qrraw = "test_qrraw"  # Mock qrraw
-        fiscal_key = qrraw if qrraw else "temp_qr_" + str(hash(file_id))
-        if await is_pending_or_processed(fiscal_key):
-            logger.info(f"Дубликат pending/processed: {fiscal_key}")
-            return None
-        pending_data = {
-            "type": "qr",
-            "file_id": file_id,
-            "user_id": bot.id,  # Заменить на реальный в хендлере
-            "chat_id": None,  # Заполнить в хендлере
-        }
-        await add_to_pending(fiscal_key, pending_data)
-        from handlers.notifications import scheduler  # Lazy import
-        scheduler.add_job(retry_check, 'interval', minutes=TEST_RETRY_INTERVAL_MIN, args=(bot, fiscal_key, "qr"))
-        return {"delayed": True, "message": "⏳ Чек пока не в базе ФНС. Проверю позже."}
     
     # Оригинальный код (не используется в TEST_MODE)
     timeout = aiohttp.ClientTimeout(total=30)
@@ -174,22 +168,31 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                         fiscal_key = f"{parsed_data['fiscal_doc']}"
                         await add_to_processed(fiscal_key)
                         return parsed_data
-                elif code == 2:
+                elif code in (2, 5):
                     qrraw = result.get("request", {}).get("qrraw", "")
-                    fiscal_key = qrraw if qrraw else "temp_qr_" + str(hash(file_id))
+                    fiscal_key = qrraw or f"temp_{hash(file_id)}"
+
+                    # если уже в pending, не добавляем снова
                     if await is_pending_or_processed(fiscal_key):
-                        logger.info(f"Дубликат pending/processed: {fiscal_key}")
-                        return None
-                    pending_data = {
-                        "type": "qr",
-                        "file_id": file_id,
-                        "user_id": bot.id,
-                        "chat_id": None,
+                        logger.info(f"ℹ️ Уже в pending, не добавляем заново: {fiscal_key}")
+                    else:
+                        pending_data = {
+                            "type": "qr",
+                            "file_id": file_id,
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "retries": 0,
+                            "created_at": time.time(),
+                        }
+                        await add_to_pending(fiscal_key, pending_data)
+                        from handlers.notifications import scheduler
+                        schedule_async_job(scheduler, retry_check, 1, bot, fiscal_key, "qr")
+
+                    return {
+                        "delayed": True,
+                        "message": "⏳ Чек пока не в базе ФНС (код 2/5). Проверю через 1 минуту и уведомлю!"
                     }
-                    await add_to_pending(fiscal_key, pending_data)
-                    from handlers.notifications import scheduler
-                    scheduler.add_job(retry_check, 'interval', minutes=PROD_RETRY_INTERVAL_MIN, args=(bot, fiscal_key, "qr"))
-                    return {"delayed": True, "message": "⏳ Чек пока не в базе ФНС. Проверю позже."}
+
                 else:
                     logger.error(f"Ошибка: code={code}, data={result.get('data')}")
                     return None
@@ -252,22 +255,6 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
         user_id_log = user.id if user else 'retry'
         logger.info(f"confirm_manual_api: Запрос к proverkacheka API с fn={fn}, fd={fd}, fp={fp}, t={t_combined}, n={n_type}, s={sum_rub}, qr=0, user_id={user_id_log}")
 
-        if TEST_MODE:
-            # Симуляция code=2 для теста
-            fiscal_key = f"{fn}:{fd}:{fp}"
-            if await is_pending_or_processed(fiscal_key):
-                return False, "❌ Чек уже в обработке или сохранён.", None
-            pending_data = {
-                "type": "manual",
-                "manual_data": data,
-                "user_id": user.id if user else None,
-                "chat_id": chat_id,
-                "retries": 0
-            }
-            await add_to_pending(fiscal_key, pending_data)
-            from handlers.notifications import scheduler  # Lazy import
-            scheduler.add_job(retry_check, 'interval', minutes=TEST_RETRY_INTERVAL_MIN, args=(bot, fiscal_key, "manual"))
-            return False, "⏳ Данные чека пока не готовы. Автоматическая проверка запущена.", None
 
         # Оригинальный код (не в TEST_MODE)
         url = "https://proverkacheka.com/api/v1/check/get"
@@ -339,20 +326,26 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                     else:
                                         logger.error("Нет data.json в ответе")
                                         return False, "❌ Нет данных чека в ответе API.", None
-                                elif code == 2:
+                                # ⏳ Чек пока не готов
+                                elif code in (2, 5):
                                     if await is_pending_or_processed(fiscal_key):
-                                        return False, "❌ Чек уже в обработке или сохранён.", None
+                                        return False, "❌ Чек уже обрабатывается.", None
+
                                     pending_data = {
                                         "type": "manual",
                                         "manual_data": data,
                                         "user_id": user.id if user else None,
                                         "chat_id": chat_id,
-                                        "retries": 0
+                                        "retries": 0,
+                                        "created_at": time.time(),
                                     }
                                     await add_to_pending(fiscal_key, pending_data)
+
                                     from handlers.notifications import scheduler
-                                    scheduler.add_job(retry_check, 'interval', minutes=PROD_RETRY_INTERVAL_MIN, args=(bot, fiscal_key, "manual"))
-                                    return False, "⏳ Данные чека пока не готовы. Автоматическая проверка запущена.", None
+                                    schedule_async_job(scheduler, retry_check, 5, bot, fiscal_key, "manual")
+
+                                    return False, "⏳ Чек пока не в базе (код 2/5). Проверю через 5 минут.", None
+
                                 elif code == 3:
                                     if attempt < max_retries:
                                         logger.warning("Rate limit (code=3). Retry через 60s.")
@@ -421,39 +414,208 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
         logger.error(f"Ошибка в confirm_manual_api: {str(e)}, data={data}", exc_info=True)
         return False, f"⚠️ Внутренняя ошибка: {str(e)}. Обратитесь к админу.", None
 
-        
+
+# ==========================================================
+# 🔄 Безопасный запуск async-задач через APScheduler
+# ==========================================================
+# Часовой пояс UTC+5
+
+LOCAL_TZ = timezone(timedelta(hours=5))
+
+def schedule_async_job(scheduler, coro_func, delay_min: int, *args):
+    """
+    Безопасное добавление async задачи (совместимо с APScheduler в отдельных потоках).
+    Работает в UTC+5 и корректно использует основной asyncio loop.
+    """
+    run_date = datetime.now(LOCAL_TZ) + timedelta(minutes=delay_min)
+    fiscal_key = str(args[1]) if len(args) > 1 else str(time.time())
+    job_id = f"{coro_func.__name__}:{fiscal_key}:{int(time.time())}"
+
+    # Берём основной event loop один раз при старте приложения
+    loop = asyncio.get_event_loop()
+
+    async def wrapper():
+        logger.info(f"▶️ [JOB START] {coro_func.__name__} для {fiscal_key}")
+        try:
+            await coro_func(*args)
+            logger.info(f"✅ [JOB DONE] {coro_func.__name__} для {fiscal_key}")
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка в async job {coro_func.__name__}: {e}", exc_info=True)
+
+    def run_in_main_loop():
+        """Запускает задачу в основном event loop, даже если APScheduler работает в другом потоке."""
+        try:
+            asyncio.run_coroutine_threadsafe(wrapper(), loop)
+        except Exception as e:
+            logger.error(f"🚨 Ошибка при запуске coroutine в основном loop: {e}", exc_info=True)
+
+    scheduler.add_job(
+        run_in_main_loop,
+        trigger="date",
+        run_date=run_date,
+        id=job_id,
+        replace_existing=False,
+        timezone=LOCAL_TZ
+    )
+
+    logger.info(
+        f"🕐 Задача '{coro_func.__name__}' запланирована ({job_id}) "
+        f"на {run_date.strftime('%H:%M:%S %Z')}"
+    )
+
+
+
+# ==========================================================
+# ♻️ Переписанный retry_check с полной совместимостью
+# ==========================================================
 async def retry_check(bot: Bot, fiscal_key: str, check_type: str):
+    """
+    Фоновая проверка чека — каждая минута, максимум 5 попыток.
+    Работает через APScheduler с повторными запросами к API.
+    """
+    from handlers.notifications import scheduler
+
     pending = await get_pending(fiscal_key)
     if not pending:
+        logger.info(f"⚠️ Pending задача не найдена: {fiscal_key}")
         return
+
     retries = pending.get('retries', 0) + 1
-    if retries > 12:  # Max 1 час
-        from handlers.notifications import send_notification  # Lazy import to avoid cycle
-        await send_notification(bot, action="❌ Ошибка: Чек не появился в ФНС после 1 часа.", is_group=False, chat_id=pending['chat_id'])
+    max_retries = 5  # 🔁 максимум 5 попыток
+    interval_min = 1  # ⏱ каждая минута
+
+    logger.info(f"▶️ RETRY_TRIGGERED: {fiscal_key}, попытка {retries}/{max_retries}, тип={check_type}")
+
+    # Если превышен лимит — уведомляем и удаляем задачу
+    if retries > max_retries:
+        await bot.send_message(
+            pending.get('chat_id'),
+            f"❌ Чек не найден после {max_retries} попыток ({max_retries} минут). Попробуйте позже или вручную."
+        )
+        logger.warning(f"❌ Чек {fiscal_key} не найден после {max_retries} попыток — удалён из pending.")
         await remove_pending(fiscal_key)
         return
 
-    # Повторный запрос
-    if check_type == "qr":
-        # Заново parse_qr_from_photo с file_id
-        parsed = await parse_qr_from_photo(bot, pending['file_id'])
-    else:  # manual
-        success, msg, parsed = await confirm_manual_api(bot, pending['manual_data'], None, pending['chat_id'])
+    try:
+        parsed_data = None
 
-    if isinstance(parsed, dict) and not parsed.get("delayed"):
-        # Успех: Уведомить с кнопкой
-        inline_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Продолжить добавление", callback_data=f"continue_add:{fiscal_key}")]])
-        await bot.send_message(pending['chat_id'], "✅ Чек найден в ФНС! Нажмите, чтобы продолжить.", reply_markup=inline_kb)
-        # Сохранить parsed в Redis для восстановления
-        await cache_set(f"parsed_data:{fiscal_key}", parsed, expire=3600)
-        await remove_pending(fiscal_key)
-        await add_to_processed(fiscal_key)
-    else:
-        # Ещё code=2: update retries и перезапланировать
+        # 🔍 Проверка QR чека
+        if check_type == "qr":
+            parsed_data = await parse_qr_from_photo(
+                bot,
+                pending.get('file_id'),
+                pending.get('user_id'),
+                pending.get('chat_id')
+            )
+
+        # 🧾 Проверка ручного чека
+        elif check_type == "manual":
+            success, msg, parsed_data = await confirm_manual_api(
+                bot,
+                pending.get('manual_data'),
+                type('User', (), {'id': pending.get('user_id')}),  # подставляем фейкового user
+                pending.get('chat_id')
+            )
+            if not success:
+                parsed_data = None
+
+        # ✅ Чек найден
+        if parsed_data and not parsed_data.get("delayed"):
+            logger.info(f"✅ Чек найден ({fiscal_key}) на попытке {retries}")
+
+            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            inline_kb = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="✅ Продолжить добавление",
+                        callback_data=f"continue_add:{fiscal_key}"
+                    )
+                ]]
+            )
+
+            await bot.send_message(
+                pending.get('chat_id'),
+                f"🎉 Чек найден после {retries} проверок!\nМожете продолжить добавление:",
+                reply_markup=inline_kb
+            )
+
+            await cache_set(f"parsed_data:{fiscal_key}", parsed_data, expire=3600)
+            await remove_pending(fiscal_key)
+            await add_to_processed(fiscal_key)
+
+        else:
+            # ❗ Чек пока не найден — пробуем снова
+            logger.info(f"🕐 Чек {fiscal_key} пока не найден (попытка {retries}/{max_retries}). Следующая через {interval_min} мин.")
+            pending['retries'] = retries
+            await update_pending(fiscal_key, pending)
+
+            # Планируем следующую проверку
+            schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
+
+    except Exception as e:
+        logger.error(f"⚠️ Ошибка в retry_check ({fiscal_key}): {e}", exc_info=True)
         pending['retries'] = retries
-        await add_to_pending(fiscal_key, pending)
-        from handlers.notifications import scheduler  # Lazy import to avoid cycle
-        scheduler.add_job(retry_check, 'interval', minutes=5, args=(bot, fiscal_key, check_type))
+        await update_pending(fiscal_key, pending)
+        schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
+
+
+
+
+async def get_pending_stats() -> dict:
+    """Статистика pending задач"""
+    keys = await redis_client.keys("pending:*")
+    stats = {
+        'total': len(keys),
+        'by_type': {},
+        'old_tasks': []
+    }
+    
+    for key in keys:
+        data = await cache_get(key)
+        if data:
+            check_type = data.get('type', 'unknown')
+            stats['by_type'][check_type] = stats['by_type'].get(check_type, 0) + 1
+            
+            # Задачи старше 1 часа
+            if time.time() - data.get('created_at', 0) > 3600:
+                stats['old_tasks'].append({
+                    'key': key,
+                    'type': check_type,
+                    'retries': data.get('retries', 0),
+                    'age_hours': (time.time() - data.get('created_at', 0)) / 3600
+                })
+    
+    return stats
+
+async def send_retry_notification(bot: Bot, pending_data: dict, result: str, retries: int, fiscal_key: str):  # ✅ ДОБАВИТЬ fiscal_key
+    """Умные уведомления о статусе проверки"""
+    chat_id = pending_data.get('chat_id')
+    if not chat_id:
+        return
+        
+    messages = {
+        'success': f"🎉 Чек найден после {retries} проверок!",
+        'retrying': f"⏳ Проверяю чек... ({retries}/12 попыток)",
+        'timeout': "❌ Чек не найден в течение 1 часа",
+        'error': "⚠️ Ошибка при проверке чека"
+    }
+    
+    message = messages.get(result, messages['error'])
+    
+    if result == 'success':
+        # Добавляем кнопку продолжения
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton  # ✅ ДОБАВИТЬ импорт
+        inline_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Продолжить добавление", 
+                    callback_data=f"continue_add:{fiscal_key}"  # ✅ ИСПОЛЬЗУЕМ fiscal_key
+                )
+            ]]
+        )
+        await bot.send_message(chat_id, message, reply_markup=inline_kb)
+    else:
+        await bot.send_message(chat_id, message)
 
 OP_TYPE_MAPPING = {
     "приход": 1,

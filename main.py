@@ -133,6 +133,7 @@ def signal_handler(signum, frame):
 # ---------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------
+
 if __name__ == "__main__":
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
@@ -140,6 +141,15 @@ if __name__ == "__main__":
     # Обработка сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # 🕐 Логирование активных задач планировщика
+    jobs = scheduler.get_jobs()
+    if jobs:
+        logger.info("📅 Активные задачи в планировщике:")
+        for job in jobs:
+            logger.info(f" - {job.id} | next run: {job.next_run_time}")
+    else:
+        logger.info("📅 Активные задачи в планировщике: []")
 
     try:
         asyncio.run(dp.start_polling(bot))

@@ -16,7 +16,7 @@ from sheets import (
     update_balance_cache_with_delta
 )
 
-from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date
+from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date, cache_get, redis_client 
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 import logging
@@ -58,27 +58,34 @@ async def reset_action(message: Message, state: FSMContext) -> None:
 async def catch_qr_photo_without_command(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await is_user_allowed(message.from_user.id):
         await message.answer("🚫 Доступ запрещен.")
-        logger.info(f"Доступ запрещен для авто-обработки QR: user_id={message.from_user.id}")
         return
 
     loading = await message.answer("⌛ Обрабатываю фото чека...")
 
     try:
+        # ИСПРАВЛЕНИЕ: Передаем user_id и chat_id
         parsed_data = await asyncio.wait_for(
-            parse_qr_from_photo(bot, message.photo[-1].file_id),
+            parse_qr_from_photo(bot, message.photo[-1].file_id, message.from_user.id, message.chat.id),
             timeout=10.0
         )
 
+        # ИСПРАВЛЕНИЕ: Проверяем флаг delayed
+        if parsed_data and parsed_data.get("delayed"):
+            await loading.edit_text(parsed_data["message"])
+            await state.clear()
+            return
+
+        # Остальная логика без изменений...
         if not parsed_data:
+            # Показываем ошибку распознавания
             inline_keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="goto_add_manual")]]
             )
             await loading.edit_text(
-                "❌ QR-код не удалось распознать. Возможно, превышено количество обращений по чеку.\n"
+                "❌ QR-код не удалось распознать.\n"
                 "Вы можете попробовать снова или добавить чек вручную:",
                 reply_markup=inline_keyboard
             )
-            logger.error(f"Не удалось распознать QR-код: user_id={message.from_user.id}")
             await state.clear()
             return
 
@@ -86,9 +93,7 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
             await loading.edit_text(
                 f"❌ Чек с фискальным номером {parsed_data['fiscal_doc']} уже существует."
             )
-            logger.info(
-                f"Авто-QR: дубликат фискального номера {parsed_data['fiscal_doc']}, user_id={message.from_user.id}"
-            )
+            logger.info(f"Авто-QR: дубликат фискального номера {parsed_data['fiscal_doc']}, user_id={message.from_user.id}")
             await state.clear()
             return
 
@@ -99,10 +104,7 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
             parsed_data=parsed_data
         )
         await state.set_state(AddReceiptQR.CUSTOMER)
-        logger.info(
-            f"Авто-старт /add по фото QR: fiscal_doc={parsed_data['fiscal_doc']}, "
-            f"qr_string={parsed_data['qr_string']}, user_id={message.from_user.id}"
-        )
+        logger.info(f"Авто-старт /add по фото QR: fiscal_doc={parsed_data['fiscal_doc']}, user_id={message.from_user.id}")
 
     except asyncio.TimeoutError:
         inline_keyboard = InlineKeyboardMarkup(
@@ -125,6 +127,48 @@ async def catch_qr_photo_without_command(message: Message, state: FSMContext, bo
         )
         logger.error(f"Ошибка обработки фото чека: {str(e)}, user_id={message.from_user.id}")
         await state.clear()
+
+@add_router.callback_query(lambda c: c.data.startswith("continue_add:"))
+async def continue_add_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработка кнопки продолжения после успешной проверки"""
+    try:
+        fiscal_key = callback.data.split(":")[1]
+        
+        # Получаем сохраненные данные чека
+        parsed_data = await cache_get(f"parsed_data:{fiscal_key}")
+        if not parsed_data:
+            await callback.message.answer("❌ Данные чека устарели. Отправьте фото заново.")
+            await callback.answer()
+            return
+        
+        # Проверяем дубликат
+        if not await is_fiscal_doc_unique(parsed_data["fiscal_doc"]):
+            await callback.message.answer(f"❌ Чек {parsed_data['fiscal_doc']} уже добавлен.")
+            await callback.answer()
+            return
+        
+        # Восстанавливаем процесс добавления
+        await state.update_data(
+            username=callback.from_user.username or str(callback.from_user.id),
+            parsed_data=parsed_data
+        )
+        await state.set_state(AddReceiptQR.CUSTOMER)
+        
+        # Очищаем временные данные
+        await redis_client.delete(f"parsed_data:{fiscal_key}")
+        
+        await callback.message.answer(
+            "🎉 Продолжаем добавление чека!\n"
+            "Введите заказчика (или /skip):",
+            reply_markup=reset_keyboard()
+        )
+        
+        await callback.answer("Процесс добавления возобновлен!")
+        
+    except Exception as e:
+        logger.error(f"Error in continue_add: {str(e)}")
+        await callback.message.answer("❌ Ошибка при продолжении добавления.")
+        await callback.answer()
 
 @add_router.callback_query(lambda c: c.data == "goto_add_manual")
 async def goto_add_manual(callback: CallbackQuery, state: FSMContext) -> None:

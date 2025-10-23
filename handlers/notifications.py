@@ -184,6 +184,31 @@ async def send_notifications(bot: Bot):
         logger.error(f"❌ Неожиданная ошибка в send_notifications: {e}")
         await asyncio.sleep(60)
 
+# 🚨 ДОБАВИТЬ В notifications.py:
+
+async def cleanup_old_pending_tasks():
+    """Автоматическая очистка устаревших pending задач (24+ часов)"""
+    try:
+        from utils import get_pending_stats, remove_pending
+        
+        stats = await get_pending_stats()
+        cleaned = 0
+        
+        for task in stats['old_tasks']:
+            # Очищаем задачи старше 24 часов
+            if task['age_hours'] > 24:
+                fiscal_key = task['key'].replace("pending:", "")
+                await remove_pending(fiscal_key)
+                cleaned += 1
+                
+        if cleaned > 0:
+            logger.info(f"🔄 Автоочистка: удалено {cleaned} старых pending задач")
+        else:
+            logger.debug("🔄 Автоочистка: старых задач не найдено")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка автоочистки pending задач: {str(e)}")
+
 
 # ==========================================================
 # 🕐 Планировщик (ежедневно по будням)
@@ -192,6 +217,11 @@ def start_notifications(bot: Bot):
     """Запуск планировщика уведомлений."""
     trigger = CronTrigger(day_of_week="mon-fri", hour=12, minute=0, timezone="Europe/Moscow")
     scheduler.add_job(send_notifications, trigger=trigger, args=[bot], max_instances=1)
+
+     # 🚨 ДОБАВИТЬ: Автоочистка каждый день в 3:00
+    cleanup_trigger = CronTrigger(hour=3, minute=0, timezone="Europe/Moscow")
+    scheduler.add_job(cleanup_old_pending_tasks, trigger=cleanup_trigger, max_instances=1)
+
     scheduler.start()
     logger.info("🕐 Scheduler уведомлений запущен (будни 12:00 МСК)")
 
