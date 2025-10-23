@@ -10,6 +10,7 @@ from handlers.add import add_router
 from handlers.return_ import return_router
 from handlers.expenses import expenses_router
 from handlers.notifications import start_notifications, scheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # Добавил импорт, если scheduler - APScheduler
 
 # ---------------------------------------------------------
 # Логирование
