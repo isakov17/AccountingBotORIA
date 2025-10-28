@@ -13,6 +13,18 @@ import time  # Для time.sleep в retry
 from io import BytesIO
 from aiogram import Bot  # Для уведомлений в retry
 from datetime import timezone
+from PIL import Image
+import io
+
+# Безопасный импорт pyzbar с обработкой ошибок
+try:
+    import pyzbar.pyzbar as pyzbar
+    from PIL import Image
+    import io
+    PYZBAR_AVAILABLE = True
+except ImportError as e:
+    PYZBAR_AVAILABLE = False
+
 
 logger = logging.getLogger("AccountingBot")
 
@@ -24,6 +36,42 @@ import asyncio
 from datetime import datetime, timedelta
 
 
+
+from aiogram import Router, F
+from aiogram.types import CallbackQuery
+
+cancel_router = Router()
+
+@cancel_router.callback_query(F.data.startswith("cancel_check:"))
+async def cancel_pending_check(callback: CallbackQuery):
+    """Обработка отмены отложенной проверки чека"""
+    try:
+        safe_fiscal_key = callback.data.split(":")[1]
+        
+        # Восстанавливаем оригинальный fiscal_key (обратная замена)
+        fiscal_key = safe_fiscal_key.replace("_", "=").replace("_", "&").replace("_", ".").replace("_", ":")
+        
+        # Удаляем из pending
+        await remove_pending(fiscal_key)
+        
+        # Удаляем связанные задачи планировщика
+        from handlers.notifications import scheduler
+        job_id = f"retry_check:{fiscal_key}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            logger.info(f"🗑️ Удалена задача планировщика: {job_id}")
+        
+        await callback.message.edit_text(
+            "❌ Проверка чека отменена. Вы можете добавить чек заново когда будет удобно.",
+            reply_markup=None
+        )
+        
+        await callback.answer("Проверка отменена")
+        logger.info(f"✅ Пользователь отменил проверку чека: {fiscal_key}, user_id={callback.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отмене проверки: {str(e)}")
+        await callback.answer("❌ Ошибка при отмене проверки")
 
 
 async def cache_get(key: str) -> any:
@@ -53,7 +101,7 @@ async def is_pending_or_processed(fiscal_key: str) -> bool:
     pending = await redis_client.exists(f"pending:{fiscal_key}")
     return processed or pending
 
-async def add_to_pending(fiscal_key: str, data: dict, expire: int = 3600) -> bool:
+async def add_to_pending(fiscal_key: str, data: dict, expire: int = 36400) -> bool:
     """Добавляет в pending с expire."""
     data['retries'] = 0
     data['created_at'] = time.time()
@@ -107,98 +155,232 @@ def safe_float(value: str | float | int, default: float = 0.0) -> float:
         return default
     return default
 
-# Тестовые константы (включить/выключить)
-PROD_RETRY_INTERVAL_MIN = 60  # Прод: 60 мин (1 час)
-PROD_MAX_RETRIES = 12  # Прод: 12 попыток (12 часов)
+# ==========================================================
+# 🔧 Константы настройки фоновых задач
+# ==========================================================
 
+# --- Режим работы (для теста можно временно включить TEST_MODE) ---
+TEST_MODE = False
+
+# --- Продакшен-параметры ---
+PROD_RETRY_INTERVAL_MIN = 3   # 60 мин (1 час)
+PROD_MAX_RETRIES = 3            # 8 попыток (8 часов)
+
+# --- Тестовый режим (ускоренный) ---
+TEST_RETRY_INTERVAL_MIN = 1
+TEST_MAX_RETRIES = 3
+
+# --- Автовыбор ---
+RETRY_INTERVAL_MIN = TEST_RETRY_INTERVAL_MIN if TEST_MODE else PROD_RETRY_INTERVAL_MIN
+MAX_RETRIES = TEST_MAX_RETRIES if TEST_MODE else PROD_MAX_RETRIES
+
+
+# Добавьте эту функцию после импортов
+async def extract_qr_raw_from_photo(photo_data: bytes) -> str | None:
+    """
+    Локально извлекает сырую строку QR-кода из изображения
+    """
+    if not PYZBAR_AVAILABLE:
+        logger.warning("❌ Pyzbar недоступен, пропускаем локальное распознавание")
+        return None
+        
+    try:
+        # Если photo_data это BytesIO, преобразуем в bytes
+        if hasattr(photo_data, 'getvalue'):
+            photo_data = photo_data.getvalue()
+        
+        # Конвертируем bytes в изображение
+        image = Image.open(io.BytesIO(photo_data))
+        
+        # Декодируем QR-коды
+        decoded_objects = pyzbar.decode(image)
+        
+        if decoded_objects:
+            for obj in decoded_objects:
+                if obj.type == 'QRCODE':
+                    qr_raw = obj.data.decode('utf-8')
+                    logger.info(f"✅ QR-код распознан локально: {qr_raw}")
+                    return qr_raw
+        
+        logger.warning("❌ QR-код не найден на изображении")
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при локальном распознавании QR-кода: {e}")
+        return None
+
+# ЗАМЕНИТЕ существующую функцию parse_qr_from_photo на эту новую версию:
 async def parse_qr_from_photo(bot, file_id, user_id=None, chat_id=None) -> dict | None:
     file = await bot.get_file(file_id)
     file_path = file.file_path
-    photo = await bot.download_file(file_path)
+    photo = await bot.download_file(file_path)  # photo это BytesIO
     
+    # 1. Сначала пробуем извлечь qrraw локально
+    # Преобразуем BytesIO в bytes для локального распознавания
+    photo_bytes = photo.getvalue() if hasattr(photo, 'getvalue') else photo
+    qr_raw = await extract_qr_raw_from_photo(photo_bytes)
     
-    # Оригинальный код (не используется в TEST_MODE)
+    if qr_raw:
+        # 2. Используем Формат запроса 2 (qrraw) - более надежный
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            form = aiohttp.FormData()
+            form.add_field("qrraw", qr_raw)
+            form.add_field("token", PROVERKACHEKA_TOKEN)
+            
+            async with session.post("https://proverkacheka.com/api/v1/check/get", data=form) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return await process_api_response(result, qr_raw, file_id, user_id, chat_id, bot)
+                else:
+                    logger.error(f"HTTP error при запросе qrraw: {response.status}")
+                    # Fallback на старый метод
+                    # Сбрасываем позицию BytesIO перед использованием
+                    if hasattr(photo, 'seek'):
+                        photo.seek(0)
+                    return await parse_qr_from_photo_fallback(bot, file_id, user_id, chat_id, photo)
+    else:
+        # 3. Если не удалось распознать QR локально - fallback на старый метод
+        logger.info("🔄 Не удалось распознать QR локально, использую старый метод")
+        # Сбрасываем позицию BytesIO перед использованием
+        if hasattr(photo, 'seek'):
+            photo.seek(0)
+        return await parse_qr_from_photo_fallback(bot, file_id, user_id, chat_id, photo)
+
+# Добавьте эту новую функцию для fallback
+async def parse_qr_from_photo_fallback(bot, file_id, user_id=None, chat_id=None, photo_data=None):
+    """Fallback метод - отправка файла как было раньше"""
+    if not photo_data:
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        photo_data = await bot.download_file(file_path)
+    
+    # Сбрасываем позицию BytesIO если нужно
+    if hasattr(photo_data, 'seek'):
+        photo_data.seek(0)
+    
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         form = aiohttp.FormData()
-        form.add_field("qrfile", photo, filename="check.jpg", content_type="image/jpeg")
+        form.add_field("qrfile", photo_data, filename="check.jpg", content_type="image/jpeg")
         form.add_field("token", PROVERKACHEKA_TOKEN)
         async with session.post("https://proverkacheka.com/api/v1/check/get", data=form) as response:
             if response.status == 200:
                 result = await response.json()
-                code = result.get("code")
-                if code == 1:
-                    data_json = result.get("data", {}).get("json", {})
-                    if data_json:
-                        items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()
-                        filtered_items = []
-                        excluded_sum = 0.0
-                        total_sum_raw = safe_float(data_json.get("totalSum", 0)) / 100
-                        if total_sum_raw == 0:
-                            total_sum_raw = sum(safe_float(it.get("sum", 0)) / 100 for it in items)
-                        for item in items:
-                            name = item.get("name", "Неизвестно").strip()
-                            total_sum_item = safe_float(item.get("sum", 0)) / 100
-                            unit_price = safe_float(item.get("price", 0)) / 100
-                            quantity = item.get("quantity", 1)
-                            if is_excluded(name):
-                                excluded_sum += total_sum_item
-                                continue
-                            filtered_items.append({
-                                "name": name,
-                                "sum": total_sum_item,
-                                "price": unit_price,
-                                "quantity": quantity
-                            })
-                        filtered_total = total_sum_raw - excluded_sum
-                        parsed_data = {
-                            "fiscal_doc": data_json.get("fiscalDocumentNumber", "unknown"),
-                            "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
-                            "store": data_json.get("user", "Неизвестно"),
-                            "items": filtered_items,
-                            "qr_string": result.get("request", {}).get("qrraw", ""),
-                            "operation_type": data_json.get("operationType", 1),
-                            "prepaid_sum": safe_float(data_json.get("prepaidSum", 0)) / 100,
-                            "total_sum": filtered_total,
-                            "totalSum": total_sum_raw,
-                            "excluded_sum": excluded_sum,
-                            "excluded_items": [item.get("name") for item in items if is_excluded(item.get("name", "").strip())]
-                        }
-                        fiscal_key = f"{parsed_data['fiscal_doc']}"
-                        await add_to_processed(fiscal_key)
-                        return parsed_data
-                elif code in (2, 5):
-                    qrraw = result.get("request", {}).get("qrraw", "")
-                    fiscal_key = qrraw or f"temp_{hash(file_id)}"
-
-                    # если уже в pending, не добавляем снова
-                    if await is_pending_or_processed(fiscal_key):
-                        logger.info(f"ℹ️ Уже в pending, не добавляем заново: {fiscal_key}")
-                    else:
-                        pending_data = {
-                            "type": "qr",
-                            "file_id": file_id,
-                            "user_id": user_id,
-                            "chat_id": chat_id,
-                            "retries": 0,
-                            "created_at": time.time(),
-                        }
-                        await add_to_pending(fiscal_key, pending_data)
-                        from handlers.notifications import scheduler
-                        schedule_async_job(scheduler, retry_check, 1, bot, fiscal_key, "qr")
-
-                    return {
-                        "delayed": True,
-                        "message": "⏳ Чек пока не в базе ФНС (код 2/5). Проверю через 1 минуту и уведомлю!"
-                    }
-
-                else:
-                    logger.error(f"Ошибка: code={code}, data={result.get('data')}")
-                    return None
+                qrraw = result.get("request", {}).get("qrraw", "")
+                return await process_api_response(result, qrraw, file_id, user_id, chat_id, bot)
             else:
-                logger.error(f"HTTP error: {response.status}")
+                logger.error(f"HTTP error в fallback: {response.status}")
                 return None
+
+# Добавьте эту новую функцию для обработки ответа API (общая для обоих методов)
+async def process_api_response(result, qr_raw, file_id, user_id, chat_id, bot):
+    """Обработка ответа от API (общая для обоих методов)"""
+    code = result.get("code")
+    
+    if code == 1:
+        # ... существующая логика для успешного ответа ...
+        return parsed_data
+    
+    # Обработка кодов 2/5 - чек не найден в базе ФНС
+    elif code in (2, 5):
+        qrraw = result.get("request", {}).get("qrraw", "") or qr_raw
+        fiscal_key = qrraw or f"temp_{hash(file_id)}"
+
+        if await is_pending_or_processed(fiscal_key):
+            logger.info(f"ℹ️ Уже в pending, не добавляем заново: {fiscal_key}")
+        else:
+            pending_data = {
+                "type": "qr",
+                "file_id": file_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "retries": 0,
+                "created_at": time.time(),
+                "last_code": code  # Сохраняем код для логики ретраев
+            }
+            await add_to_pending(fiscal_key, pending_data)
+            from handlers.notifications import scheduler
+            schedule_async_job(scheduler, retry_check, RETRY_INTERVAL_MIN, bot, fiscal_key, "qr")
+
+        return {
+            "delayed": True,
+            "message": "⏳ Чек пока не в базе ФНС (код 2/5). Запускаю фоновую проверку — теперь я буду проверять чек каждый час.\n💡 Когда чек появится, я пришлю уведомление, и вы сможете продолжить добавление.\nПовторно добавлять чек не потребуется.",
+            "retry_type": "not_found"  # Тип для разной логики ретраев
+        }
+    
+    # Обработка кода 4 - слишком частые запросы
+    elif code == 4:
+        data_field = result.get("data")
+        if isinstance(data_field, dict):
+            wait_seconds = data_field.get("wait")
+        else:
+            logger.info(f"API code=4: data={data_field}")
+            wait_seconds = None
+
+        # Прогрессивные интервалы для кода 4
+        current_pending = await get_pending(f"pending:{qr_raw}") if qr_raw else None
+        retries = current_pending.get("retries", 0) if current_pending else 0
+        
+        # Определяем интервал в зависимости от количества попыток
+        if retries == 0:
+            wait_min = 2  # Первая попытка через 2 минуты
+        elif retries == 1:
+            wait_min = 5  # Вторая попытка через 5 минут
+        elif retries == 2:
+            wait_min = 30  # Третья попытка через 30 минут
+        else:
+            wait_min = 60  # Последующие попытки через 60 минут
+        
+        # Если API указал свое время, используем его (но не меньше нашего)
+        if wait_seconds:
+            api_wait_min = max(1, int((wait_seconds + 59) // 60))
+            wait_min = max(wait_min, api_wait_min)
+
+        qrraw = result.get("request", {}).get("qrraw", "") or qr_raw
+        fiscal_key = qrraw or f"temp_{hash(file_id)}"
+
+        if await is_pending_or_processed(fiscal_key):
+            logger.info(f"ℹ️ Уже в pending (code=4), не добавляем заново: {fiscal_key}")
+        else:
+            pending_data = {
+                "type": "qr",
+                "file_id": file_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "retries": retries,
+                "created_at": time.time(),
+                "last_code": code  # Сохраняем код для логики ретраев
+            }
+            await add_to_pending(fiscal_key, pending_data)
+            from handlers.notifications import scheduler
+            schedule_async_job(scheduler, retry_check, wait_min, bot, fiscal_key, "qr")
+
+        # Создаем клавиатуру с кнопкой отмены
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        safe_fiscal_key = fiscal_key.replace("=", "_").replace("&", "_").replace(".", "_")
+
+        cancel_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="❌ Отключить проверку", 
+                    callback_data=f"cancel_check:{safe_fiscal_key}"
+                )
+            ]]
+        )
+
+        user_msg = f"⏳ Чек сейчас обрабатывается сервером. Я попробую снова через {wait_min} мин."
+        logger.info(f"ℹ️ API code=4 for {fiscal_key}, scheduled retry in {wait_min} min. (попытка {retries + 1})")
+        return {
+            "delayed": True, 
+            "message": user_msg,
+            "keyboard": cancel_keyboard,
+            "retry_type": "rate_limit"  # Тип для разной логики ретраев
+        }
+
+    else:
+        logger.error(f"Ошибка: code={code}, data={result.get('data')}")
+        return None
 
 async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, chat_id: int | None = None) -> Tuple[bool, str, Optional[Dict]]:
     """
@@ -240,6 +422,9 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
         t_combined = f"{full_date}T{full_time}"
         sum_rub = f"{s:.2f}"
         n_type = str(op_type)
+        
+        # Формируем qrraw строку для единообразия
+        qr_raw = f"t={t_combined}&s={sum_rub}&fn={fn}&i={fd}&fp={fp}&n={n_type}"
 
         # FormData
         form_data = aiohttp.FormData()
@@ -255,8 +440,6 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
         user_id_log = user.id if user else 'retry'
         logger.info(f"confirm_manual_api: Запрос к proverkacheka API с fn={fn}, fd={fd}, fp={fp}, t={t_combined}, n={n_type}, s={sum_rub}, qr=0, user_id={user_id_log}")
 
-
-        # Оригинальный код (не в TEST_MODE)
         url = "https://proverkacheka.com/api/v1/check/get"
         timeout = aiohttp.ClientTimeout(total=30)
 
@@ -273,6 +456,7 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                 result = json.loads(response_text)
                                 code = result.get("code")
                                 fiscal_key = f"{fn}:{fd}:{fp}"
+                                
                                 if code == 1:
                                     data_json = result.get("data", {}).get("json", {})
                                     if data_json:
@@ -305,7 +489,7 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
 
                                         parsed_data = {
                                             "fiscal_doc": data_json.get("fiscalDocumentNumber", f"{fn}-{fd}-{fp}"),
-                                            "qr_string": result.get("request", {}).get("qrraw", f"t={t_combined}&s={sum_rub}&fn={fn}&i={fd}&fp={fp}&n={n_type}"),
+                                            "qr_string": result.get("request", {}).get("qrraw", qr_raw),  # Используем сформированную строку
                                             "date": data_json.get("ticketDate", full_date).replace("-", "."),
                                             "store": data_json.get("user", data_json.get("retailPlace", "Неизвестно")),
                                             "items": items if items else [{"name": "Товар из чека", "sum": s, "price": s, "quantity": 1}],
@@ -326,10 +510,11 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                     else:
                                         logger.error("Нет data.json в ответе")
                                         return False, "❌ Нет данных чека в ответе API.", None
-                                # ⏳ Чек пока не готов
+                                
+                                # ⏳ Обработка отложенных запросов - УЛУЧШЕННАЯ ЛОГИКА
                                 elif code in (2, 5):
                                     if await is_pending_or_processed(fiscal_key):
-                                        return False, "❌ Чек уже обрабатывается.", None
+                                        return False, "⏳ Чек уже в обработке. Ожидайте уведомления.", None
 
                                     pending_data = {
                                         "type": "manual",
@@ -342,9 +527,10 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                     await add_to_pending(fiscal_key, pending_data)
 
                                     from handlers.notifications import scheduler
-                                    schedule_async_job(scheduler, retry_check, 5, bot, fiscal_key, "manual")
+                                    # Используем ту же логику ретраев что и для QR
+                                    schedule_async_job(scheduler, retry_check, RETRY_INTERVAL_MIN, bot, fiscal_key, "manual")
 
-                                    return False, "⏳ Чек пока не в базе (код 2/5). Проверю через 5 минут.", None
+                                    return False, "⏳ Чек пока не в базе ФНС (код 2/5). Запускаю фоновую проверку. При успешном запросе пришлю уведомление.", None
 
                                 elif code == 3:
                                     if attempt < max_retries:
@@ -352,13 +538,39 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                         await asyncio.sleep(60)
                                         continue
                                     return False, "❌ Превышено количество запросов (code=3). Подождите 1 мин и попробуйте снова.", None
+                                
+                                # В функции confirm_manual_api обновите обработку кода 4:
                                 elif code == 4:
-                                    delay = result.get("data", {}).get("wait", 5)
-                                    if attempt < max_retries:
-                                        logger.warning(f"Ожидание (code=4, wait={delay}s). Retry через {delay}s.")
-                                        await asyncio.sleep(delay)
-                                        continue
-                                    return False, f"❌ Ожидание перед повторным запросом (code=4, wait={delay}s).", None
+                                    data_field = result.get("data")
+                                    if isinstance(data_field, dict):
+                                        wait_seconds = data_field.get("wait")
+                                    else:
+                                        wait_seconds = None
+
+                                    if not wait_seconds:
+                                        wait_seconds = 120
+
+                                    wait_min = max(1, int((wait_seconds + 59) // 60))
+
+                                    if await is_pending_or_processed(fiscal_key):
+                                        return False, f"⏳ Чек уже обрабатывается. Попробую снова через {wait_min} мин.", None
+
+                                    pending_data = {
+                                        "type": "manual", 
+                                        "manual_data": data,
+                                        "user_id": user.id if user else None,
+                                        "chat_id": chat_id,
+                                        "retries": 0,
+                                        "created_at": time.time(),
+                                        "last_code": code  # Сохраняем код
+                                    }
+                                    await add_to_pending(fiscal_key, pending_data)
+
+                                    from handlers.notifications import scheduler
+                                    schedule_async_job(scheduler, retry_check, wait_min, bot, fiscal_key, "manual")
+
+                                    return False, f"⏳ Чек сейчас обрабатывается сервером. Проверю снова через {wait_min} мин.", None
+                                
                                 else:
                                     error_msg = result.get("data", {}).get("message", f"Неизвестная ошибка (code={code})")
                                     if attempt < max_retries:
@@ -366,10 +578,11 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
                                         await asyncio.sleep(5)
                                         continue
                                     return False, f"❌ Ошибка API (code={code}: {error_msg}). Проверьте FN/FD/FP.", None
+                            
                             except json.JSONDecodeError as e:
                                 logger.error(f"Invalid JSON from API: {str(e)}, text={response_text[:200]}...")
                                 if "<html" in response_text.lower() or "<!doctype" in response_text.lower():
-                                    return False, "❌ Неверный ответ от API (HTML вместо JSON). Проверьте токен или используйте фото QR.", None
+                                    return False, "❌ Неверный ответ от API (HTML вместо JSON). Проверьте токен.", None
                                 return False, "❌ Некорректный ответ от API (не JSON).", None
 
                         elif response.status in [401, 404, 429]:
@@ -414,7 +627,6 @@ async def confirm_manual_api(bot: Bot, data: Dict[str, Any], user: Any = None, c
         logger.error(f"Ошибка в confirm_manual_api: {str(e)}, data={data}", exc_info=True)
         return False, f"⚠️ Внутренняя ошибка: {str(e)}. Обратитесь к админу.", None
 
-
 # ==========================================================
 # 🔄 Безопасный запуск async-задач через APScheduler
 # ==========================================================
@@ -424,14 +636,13 @@ LOCAL_TZ = timezone(timedelta(hours=5))
 
 def schedule_async_job(scheduler, coro_func, delay_min: int, *args):
     """
-    Безопасное добавление async задачи (совместимо с APScheduler в отдельных потоках).
+    Безопасное добавление async-задачи для APScheduler.
     Работает в UTC+5 и корректно использует основной asyncio loop.
     """
     run_date = datetime.now(LOCAL_TZ) + timedelta(minutes=delay_min)
     fiscal_key = str(args[1]) if len(args) > 1 else str(time.time())
-    job_id = f"{coro_func.__name__}:{fiscal_key}:{int(time.time())}"
+    job_id = f"{coro_func.__name__}:{fiscal_key}"
 
-    # Берём основной event loop один раз при старте приложения
     loop = asyncio.get_event_loop()
 
     async def wrapper():
@@ -443,35 +654,47 @@ def schedule_async_job(scheduler, coro_func, delay_min: int, *args):
             logger.error(f"⚠️ Ошибка в async job {coro_func.__name__}: {e}", exc_info=True)
 
     def run_in_main_loop():
-        """Запускает задачу в основном event loop, даже если APScheduler работает в другом потоке."""
+        """Запускает задачу в основном event loop, даже если APScheduler в другом потоке."""
         try:
             asyncio.run_coroutine_threadsafe(wrapper(), loop)
         except Exception as e:
-            logger.error(f"🚨 Ошибка при запуске coroutine в основном loop: {e}", exc_info=True)
+            logger.error(f"🚨 Ошибка запуска coroutine в основном loop: {e}", exc_info=True)
+
+    # Удаляем старую задачу с тем же ID, если есть
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        logger.warning(f"♻️ Старое задание {job_id} заменено новым")
 
     scheduler.add_job(
-        run_in_main_loop,
+        func=run_in_main_loop,
         trigger="date",
         run_date=run_date,
         id=job_id,
-        replace_existing=False,
-        timezone=LOCAL_TZ
+        replace_existing=True,
+        misfire_grace_time=60,
+        timezone=LOCAL_TZ,
     )
 
     logger.info(
-        f"🕐 Задача '{coro_func.__name__}' запланирована ({job_id}) "
-        f"на {run_date.strftime('%H:%M:%S %Z')}"
+        f"🕐 Задача '{coro_func.__name__}' ({job_id}) запланирована на {run_date.strftime('%H:%M:%S %Z')}"
     )
+    return job_id
 
 
 
 # ==========================================================
 # ♻️ Переписанный retry_check с полной совместимостью
 # ==========================================================
+from utils import RETRY_INTERVAL_MIN, MAX_RETRIES
+
+# ==========================================================
+# ♻️ Умный retry_check с уведомлениями и адаптивным интервалом
+# ==========================================================
 async def retry_check(bot: Bot, fiscal_key: str, check_type: str):
     """
-    Фоновая проверка чека — каждая минута, максимум 5 попыток.
-    Работает через APScheduler с повторными запросами к API.
+    Фоновая проверка чека через APScheduler.
+    • Для кода 4 (rate limit): 2 мин → 5 мин → 30 мин → 60 мин (макс 4 попытки)
+    • Для кодов 2/5 (not found): 60 мин (макс 8 попыток)
     """
     from handlers.notifications import scheduler
 
@@ -480,46 +703,56 @@ async def retry_check(bot: Bot, fiscal_key: str, check_type: str):
         logger.info(f"⚠️ Pending задача не найдена: {fiscal_key}")
         return
 
-    retries = pending.get('retries', 0) + 1
-    max_retries = 5  # 🔁 максимум 5 попыток
-    interval_min = 1  # ⏱ каждая минута
+    retries = pending.get("retries", 0) + 1
+    last_code = pending.get("last_code")
+    
+    # Разные лимиты для разных типов ошибок
+    if last_code == 4:
+        max_retries = 4  # Макс 4 попытки для rate limit
+        retry_type = "rate_limit"
+    else:
+        max_retries = MAX_RETRIES  # 8 попыток для not found
+        retry_type = "not_found"
+    
+    logger.info(f"▶️ RETRY_TRIGGERED: {fiscal_key}, попытка {retries}/{max_retries}, тип={check_type}, ошибка={retry_type}")
 
-    logger.info(f"▶️ RETRY_TRIGGERED: {fiscal_key}, попытка {retries}/{max_retries}, тип={check_type}")
-
-    # Если превышен лимит — уведомляем и удаляем задачу
+    # --- Если превышен лимит ---
     if retries > max_retries:
-        await bot.send_message(
-            pending.get('chat_id'),
-            f"❌ Чек не найден после {max_retries} попыток ({max_retries} минут). Попробуйте позже или вручную."
-        )
-        logger.warning(f"❌ Чек {fiscal_key} не найден после {max_retries} попыток — удалён из pending.")
+        if retry_type == "rate_limit":
+            message = f"❌ Чек не обработан после {max_retries} попыток. Сервер перегружен.\nПопробуйте позже или добавьте чек вручную."
+        else:
+            message = f"❌ Чек не найден после {max_retries} попыток ({max_retries} часов).\nПопробуйте позже или добавьте чек вручную."
+        
+        await bot.send_message(pending.get("chat_id"), message)
+        logger.warning(f"❌ Чек {fiscal_key} не обработан после {max_retries} попыток — удалён из pending.")
         await remove_pending(fiscal_key)
         return
 
     try:
         parsed_data = None
+        chat_id = pending.get("chat_id")
 
-        # 🔍 Проверка QR чека
+        # --- Проверка QR ---
         if check_type == "qr":
             parsed_data = await parse_qr_from_photo(
                 bot,
-                pending.get('file_id'),
-                pending.get('user_id'),
-                pending.get('chat_id')
+                pending.get("file_id"),
+                pending.get("user_id"),
+                chat_id
             )
 
-        # 🧾 Проверка ручного чека
+        # --- Проверка manual ---
         elif check_type == "manual":
             success, msg, parsed_data = await confirm_manual_api(
                 bot,
-                pending.get('manual_data'),
-                type('User', (), {'id': pending.get('user_id')}),  # подставляем фейкового user
-                pending.get('chat_id')
+                pending.get("manual_data"),
+                type("User", (), {"id": pending.get("user_id")}),
+                chat_id
             )
             if not success:
                 parsed_data = None
 
-        # ✅ Чек найден
+        # --- ✅ Чек найден ---
         if parsed_data and not parsed_data.get("delayed"):
             logger.info(f"✅ Чек найден ({fiscal_key}) на попытке {retries}")
 
@@ -534,32 +767,84 @@ async def retry_check(bot: Bot, fiscal_key: str, check_type: str):
             )
 
             await bot.send_message(
-                pending.get('chat_id'),
-                f"🎉 Чек найден после {retries} проверок!\nМожете продолжить добавление:",
+                chat_id,
+                f"🎉 Чек найден после {retries} проверок!\n"
+                f"Теперь можно продолжить добавление:",
                 reply_markup=inline_kb
             )
 
             await cache_set(f"parsed_data:{fiscal_key}", parsed_data, expire=3600)
             await remove_pending(fiscal_key)
             await add_to_processed(fiscal_key)
+            return
 
+        # --- ❗ Чек не найден — планируем следующую проверку ---
+        # Разные интервалы для разных типов ошибок
+        if retry_type == "rate_limit":
+            # Прогрессивные интервалы для кода 4
+            if retries == 1:
+                interval_min = 2
+            elif retries == 2:
+                interval_min = 5
+            elif retries == 3:
+                interval_min = 30
+            else:
+                interval_min = 60
+            
+            # Сообщения для rate limit
+            if retries == 1:
+                message_text = "⏳ Чек сейчас обрабатывается сервером. Я попробую снова через 2 мин."
+            elif retries == 2:
+                message_text = "⏳ Чек всё ещё обрабатывается сервером. Я попробую снова через 5 мин."
+            elif retries == 3:
+                message_text = "⏳ Чек обрабатывается дольше обычного. Я попробую снова через 30 мин."
+            else:
+                message_text = "⏳ Чек продолжает обрабатываться. Я проверяю каждый час."
+            safe_fiscal_key = fiscal_key.replace("=", "_").replace("&", "_").replace(".", "_")
+
+            # Добавляем кнопку отмены для rate limit
+            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            cancel_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="❌ Отключить проверку", 
+                        callback_data=f"cancel_check:{safe_fiscal_key}"
+                    )
+                ]]
+            )
+            
+            await bot.send_message(chat_id, message_text, reply_markup=cancel_keyboard)
+            
         else:
-            # ❗ Чек пока не найден — пробуем снова
-            logger.info(f"🕐 Чек {fiscal_key} пока не найден (попытка {retries}/{max_retries}). Следующая через {interval_min} мин.")
-            pending['retries'] = retries
-            await update_pending(fiscal_key, pending)
+            # Для кодов 2/5 - фиксированный интервал 60 минут
+            interval_min = RETRY_INTERVAL_MIN  # 60 минут
+            
+            # Только первое уведомление для not found
+            if retries == 1:
+                await bot.send_message(
+                    chat_id,
+                    "⏳ Чек пока не в базе ФНС (код 2/5). Запускаю фоновую проверку — теперь я буду проверять чек каждый час.\n"
+                    "💡 Когда чек появится, я пришлю уведомление, и вы сможете продолжить добавление.\n"
+                    "Повторно добавлять чек не потребуется."
+                )
 
-            # Планируем следующую проверку
-            schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
+        logger.info(
+            f"🕐 Чек {fiscal_key} пока не найден (попытка {retries}/{max_retries}, тип={retry_type}). "
+            f"Следующая через {interval_min} мин."
+        )
+
+        # сохраняем прогресс
+        pending["retries"] = retries
+        await update_pending(fiscal_key, pending)
+
+        # запланировать следующую задачу
+        schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
 
     except Exception as e:
         logger.error(f"⚠️ Ошибка в retry_check ({fiscal_key}): {e}", exc_info=True)
-        pending['retries'] = retries
+        pending["retries"] = retries
         await update_pending(fiscal_key, pending)
-        schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
-
-
-
+        schedule_async_job(scheduler, retry_check, RETRY_INTERVAL_MIN, bot, fiscal_key, check_type)
 
 async def get_pending_stats() -> dict:
     """Статистика pending задач"""
@@ -639,3 +924,66 @@ def norm(s: str) -> str:
     s = (s or "").lower()
     s = " ".join(s.split())  # Удалить лишние пробелы
     return s
+
+async def restore_pending_tasks(bot: Bot):
+    """Восстанавливает pending задачи при перезапуске бота"""
+    try:
+        from handlers.notifications import scheduler
+        
+        # Получаем все pending задачи из Redis
+        pending_keys = await redis_client.keys("pending:*")
+        restored_count = 0
+        
+        logger.info(f"🔍 Найдено {len(pending_keys)} pending задач для восстановления")
+        
+        for key in pending_keys:
+            try:
+                pending_data = await cache_get(key)
+                if not pending_data:
+                    continue
+                    
+                fiscal_key = key.replace("pending:", "")
+                check_type = pending_data.get("type", "qr")
+                retries = pending_data.get("retries", 0)
+                last_code = pending_data.get("last_code")
+                created_at = pending_data.get("created_at", 0)
+                
+                # Пропускаем слишком старые задачи (старше 24 часов)
+                if time.time() - created_at > 86400:  # 24 часа
+                    logger.info(f"🗑️ Удалена устаревшая задача: {fiscal_key}")
+                    await remove_pending(fiscal_key)
+                    continue
+                
+                # Определяем интервал в зависимости от типа ошибки и количества попыток
+                if last_code == 4:
+                    # Rate limit - прогрессивные интервалы
+                    if retries == 0:
+                        interval_min = 2
+                    elif retries == 1:
+                        interval_min = 5
+                    elif retries == 2:
+                        interval_min = 30
+                    else:
+                        interval_min = 60
+                    error_type = "rate_limit"
+                else:
+                    # Not found - 60 минут
+                    interval_min = RETRY_INTERVAL_MIN
+                    error_type = "not_found"
+                
+                # Планируем задачу
+                schedule_async_job(scheduler, retry_check, interval_min, bot, fiscal_key, check_type)
+                restored_count += 1
+                
+                logger.info(f"♻️ Восстановлена задача: {fiscal_key}, тип={check_type}, попытки={retries}, ошибка={error_type}, интервал={interval_min}мин")
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка восстановления задачи {key}: {e}")
+                continue
+        
+        logger.info(f"✅ Восстановлено {restored_count} pending задач при запуске")
+        return restored_count
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка восстановления pending задач: {e}")
+        return 0

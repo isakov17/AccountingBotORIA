@@ -16,7 +16,7 @@ from sheets import (
     update_balance_cache_with_delta
 )
 
-from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date, cache_get, redis_client 
+from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date, cache_get, redis_client, RETRY_INTERVAL_MIN
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 import logging
@@ -220,7 +220,7 @@ async def process_qr_upload(message: Message, state: FSMContext, bot: Bot) -> No
         await message.answer("Пожалуйста, отправьте фото QR-кода чека.", reply_markup=reset_keyboard())
         logger.info(f"Фото отсутствует для QR: user_id={message.from_user.id}")
         return
-    parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
+    parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id, message.from_user.id, message.chat.id)
     if not parsed_data:
         await message.answer("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий, или используйте /add_manual для ручного ввода.", reply_markup=reset_keyboard())
         logger.error(f"Ошибка обработки QR-кода: user_id={message.from_user.id}")
