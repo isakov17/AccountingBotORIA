@@ -15,7 +15,7 @@ from sheets import (
     update_balance_cache_with_delta,
     batch_update_sheets
 )
-from utils import safe_float, parse_qr_from_photo, reset_keyboard
+from utils import safe_float, parse_qr_from_photo, reset_keyboard, build_qr_from_manual, process_check_from_qrraw
 from handlers.notifications import send_notification
 from config import SHEET_NAME  # Для spreadsheetId
 from googleapiclient.errors import HttpError
@@ -30,6 +30,7 @@ class ConfirmDelivery(StatesGroup):
     SELECT_RECEIPT = State()
     SELECT_ITEMS = State()
     UPLOAD_FULL_QR = State()
+    MANUAL_ENTRY = State()   # ✅ новое состояние
     CONFIRM_ACTION = State()
 
 def _norm_name(s: str) -> str:
@@ -207,8 +208,21 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot) -> None:
 
     parsed = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed:
-        await loading.edit_text("Не удалось распознать QR. Проверьте качество фото.")
+        await loading.delete()
+        await message.answer(
+            "❌ Не удалось распознать QR-код.\n"
+            "Введите данные вручную:\n\n"
+            "📄 Формат:\n"
+            "<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+            "Пример:\n"
+            "<code>9960440302201159 12345 6789012345 1500.00 28.10.2025 14:30</code>\n\n"
+            "Или /cancel чтобы выйти.",
+            parse_mode="HTML"
+        )
+        await state.set_state(ConfirmDelivery.MANUAL_ENTRY)
+        logger.info(f"Переход в ручной ввод расходов: user_id={message.from_user.id}")
         return
+
 
     if parsed.get("operation_type") != 1:
         await loading.edit_text("Это не чек полного расчёта (operationType должен быть 1).")
@@ -250,6 +264,48 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot) -> None:
     ])
     await loading.edit_text("✅ Проверка пройдена.\n" + "\n".join(details), reply_markup=kb)
     await state.set_state(ConfirmDelivery.CONFIRM_ACTION)
+
+@expenses_router.message(ConfirmDelivery.MANUAL_ENTRY)
+async def handle_manual_expense_entry(message: Message, state: FSMContext):
+    """
+    Обработка ручного ввода QR для расходов (если фото не распознано)
+    """
+    text = message.text.strip()
+    parts = text.split()
+
+    if len(parts) != 6:
+        await message.answer("⚠️ Формат неверный. Используй пример:\n<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode="HTML")
+        return
+
+    fn, fd, fp, s, date_str, time_str = parts
+    data = {
+        "fn": fn,
+        "fd": fd,
+        "fp": fp,
+        "s": s,
+        "date": date_str,
+        "time": time_str,
+        "op_type": 1  # ✅ Полный расчёт
+    }
+
+    qr_raw = await build_qr_from_manual(data)
+    if not qr_raw:
+        await message.answer("❌ Не удалось сформировать QR. Проверьте ввод.")
+        return
+
+    await message.answer("⌛ Проверяю чек через API...")
+    success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
+
+    if not success or not parsed_data:
+        await message.answer(f"❌ Ошибка: {msg}")
+        await state.clear()
+        return
+
+    await message.answer("✅ Чек успешно найден и подтверждён.")
+    await state.update_data(qr_parsed=parsed_data)
+    await state.set_state(ConfirmDelivery.CONFIRM_ACTION)
+    logger.info(f"Ручной ввод расходов успешен: fiscal={parsed_data.get('fiscal_doc')}, user={message.from_user.id}")
+
 
 @expenses_router.callback_query(ConfirmDelivery.CONFIRM_ACTION, F.data.in_(["confirm:delivery_many", "confirm:cancel"]))
 async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> None:

@@ -16,7 +16,7 @@ from sheets import (
     update_balance_cache_with_delta
 )
 
-from utils import parse_qr_from_photo, confirm_manual_api, safe_float, reset_keyboard, normalize_date
+from utils import parse_qr_from_photo, build_qr_from_manual, safe_float, reset_keyboard, normalize_date, process_check_from_qrraw
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 import logging
@@ -601,26 +601,42 @@ async def add_manual_type(message: Message, state: FSMContext) -> None:
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_manual_api")],
+        [InlineKeyboardButton(text="✅ Да", callback_data="build_qr_from_manual")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_manual_api")]
     ])
     await message.answer(details, reply_markup=kb)
     await state.set_state(AddManualAPI.CONFIRM)
 
-@add_router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "confirm_manual_api")
+@add_router.callback_query(AddManualAPI.CONFIRM, lambda c: c.data == "build_qr_from_manual")
 async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Обрабатывает подтверждение ручного ввода чека:
+    - формирует qrraw из данных состояния;
+    - отправляет запрос на API;
+    - возвращает результат пользователю.
+    """
     data = await state.get_data()
     loading = await callback.message.answer("⌛ Запрашиваю данные чека...")
 
     try:
-        success, msg, parsed_data = await confirm_manual_api(data, callback.from_user)
-
-        if not success or not parsed_data:
-            await loading.edit_text(msg)
+        # 🔹 1. Формируем QR из ручных данных
+        qr_raw = await build_qr_from_manual(data)
+        if not qr_raw:
+            await loading.edit_text("⚠️ Недостаточно данных для формирования QR-кода.")
             await state.clear()
             await callback.answer()
             return
 
+        # 🔹 2. Отправляем запрос в API
+        success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
+
+        if not success or not parsed_data:
+            await loading.edit_text(f"❌ Ошибка: {msg}")
+            await state.clear()
+            await callback.answer()
+            return
+
+        # 🔹 3. Успешный результат
         await loading.edit_text("✅ Чек получен.")
         await callback.message.answer("Введите заказчика (или /skip):", reply_markup=reset_keyboard())
 
@@ -640,7 +656,7 @@ async def confirm_manual_api_callback(callback: CallbackQuery, state: FSMContext
         await callback.answer()
     except Exception as exc:
         error_type = type(exc).__name__
-        await loading.edit_text(f"⚠️ Ошибка: {error_type}: {str(exc)}.")
+        await loading.edit_text(f"⚠️ Ошибка: {error_type}: {str(exc)}")
         logger.error(f"Handler error: {error_type}: {str(exc)}, user={callback.from_user.id}")
         await state.clear()
         await callback.answer()

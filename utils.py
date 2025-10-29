@@ -11,8 +11,15 @@ from typing import Tuple, Dict, Any, Optional
 import requests  # Для API запросов (fallback)
 import time  # Для time.sleep в retry
 from io import BytesIO
+import cv2
+import numpy as np
+from pyzbar.pyzbar import decode
+import asyncio
+
 
 logger = logging.getLogger("AccountingBot")
+PROVERKA_API_URL = "https://proverkacheka.com/api/v1/check/get"
+
 
 # Redis с pool и reconnect
 pool = redis.ConnectionPool(host='localhost', port=6379, db=0, decode_responses=True, max_connections=10, retry_on_timeout=True)
@@ -68,283 +75,206 @@ def safe_float(value: str | float | int, default: float = 0.0) -> float:
         return default
     return default
 
-async def parse_qr_from_photo(bot, file_id) -> dict | None:
-    file = await bot.get_file(file_id)
-    file_path = file.file_path
-    photo = await bot.download_file(file_path)
-    
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        form = aiohttp.FormData()
-        form.add_field("qrfile", photo, filename="check.jpg", content_type="image/jpeg")
-        form.add_field("token", PROVERKACHEKA_TOKEN)
-        async with session.post("https://proverkacheka.com/api/v1/check/get", data=form) as response:
-            if response.status == 200:
-                result = await response.json()
-                if result.get("code") == 1:
-                    data_json = result.get("data", {}).get("json", {})
-                    if data_json:
-                        items = data_json.get("items", [])
-                        excluded_items = get_excluded_items()  # Твоя функция? (или DEFAULT)
-                        filtered_items = []
-                        excluded_sum = 0.0
+# ==================== 1. QR из фотографии ====================
 
-                        # ✅ Raw totalSum (полная, до фильтра)
-                        total_sum_raw = safe_float(data_json.get("totalSum", 0)) / 100  # 2019.00
-                        if total_sum_raw == 0:
-                            # Fallback: sum всех items (если API не дал totalSum)
-                            total_sum_raw = sum(safe_float(it.get("sum", 0)) / 100 for it in items)
-                            logger.warning(f"Fallback total_sum_raw: {total_sum_raw:.2f} (totalSum был 0 в API)")
-
-                        for item in items:
-                            name = item.get("name", "Неизвестно").strip()
-                            total_sum_item = safe_float(item.get("sum", 0)) / 100  # RUB
-                            unit_price = safe_float(item.get("price", 0)) / 100
-                            quantity = item.get("quantity", 1)
-
-                            if is_excluded(name):
-                                logger.info(f"Найден исключённый товар: '{name}' (сумма: {total_sum_item})")
-                                excluded_sum += total_sum_item
-                                continue
-
-                            filtered_items.append({
-                                "name": name,
-                                "sum": total_sum_item,
-                                "price": unit_price,
-                                "quantity": quantity
-                            })
-
-                        filtered_total = total_sum_raw - excluded_sum  # Для add.py (1922.85)
-
-                        # ✅ ЛОГ RAW/PARSED ДЛЯ DEBUG
-                        logger.info(f"QR parsed (API): totalSum_raw={total_sum_raw:.2f} (full), filtered_total={filtered_total:.2f}, excluded_sum={excluded_sum:.2f}, items_count={len(filtered_items)}, user_id={bot.id if bot else 'unknown'}")
-
-                        return {
-                            "fiscal_doc": data_json.get("fiscalDocumentNumber", "unknown"),
-                            "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
-                            "store": data_json.get("user", "Неизвестно"),
-                            "items": filtered_items,
-                            "qr_string": result.get("request", {}).get("qrraw", ""),
-                            "operation_type": data_json.get("operationType", 1),
-                            "prepaid_sum": safe_float(data_json.get("prepaidSum", 0)) / 100,
-                            "total_sum": filtered_total,  # Для add.py (filtered, как раньше)
-                            "totalSum": total_sum_raw,  # ✅ НОВОЕ: Полная для return.py (full, 2019.00)
-                            "excluded_sum": excluded_sum,
-                            "excluded_items": [
-                                item.get("name") for item in items if is_excluded(item.get("name", "").strip())
-                            ]
-                        }
-                    else:
-                        logger.error("Нет данных JSON в ответе от proverkacheka.com")
-                        return None
-                else:
-                    logger.error(
-                        f"Ошибка обработки на proverkacheka.com: code={result.get('code')}, message={result.get('data')}"
-                    )
-                    return None
-            else:
-                logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
-                return None
-            # ... (остальной код, если есть)
-
-async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str, Optional[Dict]]:
+async def parse_qr_from_photo(bot, file_id: str) -> dict | None:
     """
-    Запрос к proverkacheka.com API для manual чека (Формат 1 из спецификации).
-    POST form-data: token, fn, fd, fp, t=YYYYMMDDTHHMM, n=op_type (1-4), s=RUB (str, e.g., '27.20'), qr=0.
-    Возвращает: (success: bool, message: str, parsed_data: dict or None)
+    Получает file_id фото от Telegram, скачивает его,
+    парсит QR-код и отправляет на API proverkacheka.com.
+    Возвращает dict с данными чека или None.
     """
     try:
-        fn = data.get('fn', '').strip()
-        fd = data.get('fd', '').strip()
-        fp = data.get('fp', '').strip()
-        s = float(data.get('s', 0))
-        date_str = data.get('date', '').strip()
-        time_str = data.get('time', '').strip()
-        op_type = int(data.get('op_type', 1))
+        # 1️⃣ Скачиваем файл
+        file = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        image_data = np.asarray(bytearray(file_bytes.read()), dtype=np.uint8)
+        image = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
+        # 2️⃣ Пытаемся распознать QR
+        decoded = decode(image)
+        if not decoded:
+            logger.warning("QR-код не найден на изображении.")
+            return None
+
+        qr_raw = decoded[0].data.decode("utf-8").strip()
+        logger.info(f"✅ Распознан QR: {qr_raw}")
+
+        # 3️⃣ Передаем QR в универсальную обработку
+        success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
+
+        if not success:
+            logger.error(f"Ошибка при обработке QR: {msg}")
+            return None
+
+        # 4️⃣ Возвращаем итоговый словарь
+        parsed_data["qr_string"] = qr_raw
+        parsed_data["fiscal_doc"] = parsed_data.get("fiscal_doc") or "N/A"
+        return parsed_data
+
+    except Exception as e:
+        logger.error(f"Ошибка в parse_qr_from_photo: {e}")
+        return None
+
+
+
+# ==================== 2. QR из ручного ввода ====================
+
+async def build_qr_from_manual(data: dict) -> str | None:
+    """
+    Формирует строку qrraw из ручного ввода FN, FD, FP, суммы и даты.
+    Пример результата: t=20251029T1423&s=123.45&fn=9282000100012345&i=12345&fp=9876543210&n=1
+    """
+    try:
+        fn = data.get("fn", "").strip()
+        fd = data.get("fd", "").strip()
+        fp = data.get("fp", "").strip()
+        s = float(data.get("s", 0))
+        date_str = data.get("date", "").strip()
+        time_str = data.get("time", "").strip()
+        n_type = str(data.get("op_type", 1))
 
         if not all([fn, fd, fp, date_str]):
-            return False, "❌ Недостаточно данных (FN, FD, FP, дата обязательны).", None
+            logger.warning("Недостаточно данных для формирования QR.")
+            return None
 
-        # Форматируем дату: ддммгг → YYYYMMDD
-        if len(date_str) == 6:
-            day, month, year = date_str[:2].zfill(2), date_str[2:4].zfill(2), f"20{date_str[4:6]}"
-            full_date = f"{year}{month}{day}"  # e.g., 080925 → 20250908
+        # 🕓 Форматируем дату
+        if len(date_str) == 6:  # ддммгг
+            day, month, year = date_str[:2], date_str[2:4], f"20{date_str[4:6]}"
+            full_date = f"{year}{month}{day}"
         else:
-            # Fallback: парсим как DD.MM.YYYY → YYYYMMDD
             try:
                 dt = datetime.strptime(date_str, "%d.%m.%Y")
                 full_date = dt.strftime("%Y%m%d")
             except ValueError:
                 full_date = datetime.now().strftime("%Y%m%d")
 
-        # Время: ЧЧММ или ЧЧ:ММ → HHMM
-        if ':' in time_str:
-            full_time = time_str.replace(":", "")  # 18:34 → 1834
+        # ⏰ Форматируем время
+        if ":" in time_str:
+            full_time = time_str.replace(":", "")
         elif len(time_str) == 4:
-            full_time = time_str  # 1834
+            full_time = time_str
         else:
             full_time = datetime.now().strftime("%H%M")
 
-        # t = YYYYMMDDTHHMM
-        t_combined = f"{full_date}T{full_time}"
+        t = f"{full_date}T{full_time}"
+        s_str = f"{s:.2f}"
 
-        # Сумма в RUB (str с десятичной, e.g., '27.20')
-        sum_rub = f"{s:.2f}"
-
-        # n = op_type (1=приход, 2=возврат прихода, 3=расход, 4=возврат расхода)
-        n_type = str(op_type)
-
-        # FormData по спецификации (multipart/form-data)
-        form_data = aiohttp.FormData()
-        form_data.add_field("token", PROVERKACHEKA_TOKEN)
-        form_data.add_field("fn", fn)
-        form_data.add_field("fd", fd)
-        form_data.add_field("fp", fp)
-        form_data.add_field("t", t_combined)  # YYYYMMDDTHHMM
-        form_data.add_field("n", n_type)
-        form_data.add_field("s", sum_rub)  # RUB str
-        form_data.add_field("qr", "0")  # Manual, не QR
-
-        logger.info(f"confirm_manual_api: Запрос к proverkacheka API с fn={fn}, fd={fd}, fp={fp}, t={t_combined}, n={n_type}, s={sum_rub}, qr=0, user_id={user.id}")
-
-        url = "https://proverkacheka.com/api/v1/check/get"
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, data=form_data) as response:
-                        response_text = await response.text()
-                        logger.info(f"API response: status={response.status}, text={response_text[:200]}...")
-
-                        if response.status == 200:
-                            try:
-                                result = json.loads(response_text)
-                                code = result.get("code")
-                                if code == 1:
-                                    # Успех: data.json
-                                    data_json = result.get("data", {}).get("json", {})
-                                    if data_json:
-                                        # Парсинг по спецификации
-                                        items_raw = data_json.get("items", [])
-                                        items = []
-                                        excluded_sum = 0.0
-                                        excluded_items_list = []
-
-                                        for item in items_raw:
-                                            name = item.get("name", "Неизвестно").strip()
-                                            total_sum_item = safe_float(item.get("sum", 0)) / 100.0  # копейки → RUB
-                                            unit_price = safe_float(item.get("price", 0)) / 100.0
-                                            quantity = item.get("quantity", 1)
-
-                                            if is_excluded(name):
-                                                logger.info(f"Найден исключённый товар: '{name}' (сумма: {total_sum_item})")
-                                                excluded_sum += total_sum_item
-                                                excluded_items_list.append(name)
-                                                continue
-
-                                            items.append({
-                                                "name": name,
-                                                "sum": total_sum_item,
-                                                "price": unit_price,
-                                                "quantity": quantity
-                                            })
-
-                                        total_sum_raw = safe_float(data_json.get("totalSum", 0)) / 100.0
-                                        filtered_total = total_sum_raw - excluded_sum
-
-                                        parsed_data = {
-                                            "fiscal_doc": data_json.get("fiscalDocumentNumber", f"{fn}-{fd}-{fp}"),
-                                            "qr_string": result.get("request", {}).get("qrraw", f"t={t_combined}&s={sum_rub}&fn={fn}&i={fd}&fp={fp}&n={n_type}"),
-                                            "date": data_json.get("ticketDate", full_date).replace("-", "."),
-                                            "store": data_json.get("user", data_json.get("retailPlace", "Неизвестно")),
-                                            "items": items if items else [{"name": "Товар из чека", "sum": s, "price": s, "quantity": 1}],  # Fallback
-                                            "operation_type": data_json.get("operationType", op_type),
-                                            "total_sum": filtered_total,
-                                            "excluded_sum": excluded_sum,
-                                            "excluded_items": excluded_items_list,
-                                            "nds18": data_json.get("nds18", 0) / 100.0,
-                                            "nds": data_json.get("nds", 0) / 100.0,
-                                            "nds0": data_json.get("nds0", 0) / 100.0,
-                                            "ndsNo": data_json.get("ndsNo", 0) / 100.0,
-                                            "cashTotalSum": data_json.get("cashTotalSum", 0) / 100.0,
-                                            "ecashTotalSum": data_json.get("ecashTotalSum", 0) / 100.0
-                                        }
-                                        logger.info(f"API success: code=1, parsed_data keys={list(parsed_data.keys())}, items_count={len(items)}")
-                                        return True, "✅ Данные чека получены из API.", parsed_data
-                                    else:
-                                        logger.error("Нет data.json в ответе")
-                                        return False, "❌ Нет данных чека в ответе API.", None
-                                elif code == 2:
-                                    return False, "⏳ Данные чека пока не готовы. Попробуйте позже.", None
-                                elif code == 3:
-                                    if attempt < max_retries:
-                                        logger.warning("Rate limit (code=3). Retry через 60s.")
-                                        time.sleep(60)  # code=3: превышено кол-во запросов, подождать 1 мин
-                                        continue
-                                    return False, "❌ Превышено количество запросов (code=3). Подождите 1 мин и попробуйте снова.", None
-                                elif code == 4:
-                                    delay = result.get("data", {}).get("wait", 5)
-                                    if attempt < max_retries:
-                                        logger.warning(f"Ожидание (code=4, wait={delay}s). Retry через {delay}s.")
-                                        time.sleep(delay)
-                                        continue
-                                    return False, f"❌ Ожидание перед повторным запросом (code=4, wait={delay}s).", None
-                                else:  # code=0,5 или другие
-                                    error_msg = result.get("data", {}).get("message", f"Неизвестная ошибка (code={code})")
-                                    if attempt < max_retries:
-                                        logger.warning(f"API error code={code}: {error_msg}. Retry {attempt}/{max_retries} через 5s.")
-                                        time.sleep(5)
-                                        continue
-                                    return False, f"❌ Ошибка API (code={code}: {error_msg}). Проверьте FN/FD/FP.", None
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Invalid JSON from API: {str(e)}, text={response_text[:200]}...")
-                                if "<html" in response_text.lower() or "<!doctype" in response_text.lower():
-                                    return False, "❌ Неверный ответ от API (HTML вместо JSON). Проверьте токен или используйте фото QR.", None
-                                return False, "❌ Некорректный ответ от API (не JSON).", None
-
-                        elif response.status in [401, 404, 429]:
-                            if response.status == 429:
-                                if attempt < max_retries:
-                                    logger.warning("HTTP Rate limit 429. Retry через 10s.")
-                                    time.sleep(10)
-                                    continue
-                                return False, "❌ Лимит запросов (HTTP 429). Подождите 1 мин.", None
-                            else:
-                                if attempt < max_retries:
-                                    logger.warning(f"HTTP error {response.status}. Retry {attempt}/{max_retries} через 5s.")
-                                    time.sleep(5)
-                                    continue
-                                return False, f"❌ HTTP Ошибка: code={response.status}. Проверьте данные.", None
-
-                        else:
-                            return False, f"❌ Ошибка API: HTTP {response.status}, {response_text[:100]}...", None
-
-            except aiohttp.ClientTimeout:
-                if attempt < max_retries:
-                    logger.warning(f"Timeout. Retry {attempt}/{max_retries}.")
-                    time.sleep(5)
-                    continue
-                return False, "❌ Таймаут запроса к API. Проверьте интернет.", None
-            except aiohttp.ClientError as e:
-                logger.error(f"Request error: {str(e)}")
-                if attempt < max_retries:
-                    time.sleep(5)
-                    continue
-                return False, f"⚠️ Ошибка сети: {str(e)}.", None
-            except Exception as e:
-                logger.error(f"Unexpected error in API request: {str(e)}")
-                if attempt < max_retries:
-                    time.sleep(5)
-                    continue
-                return False, f"⚠️ Неожиданная ошибка: {str(e)}.", None
-
-        return False, "❌ Не удалось получить данные чека после 3 попыток.", None
+        qrraw = f"t={t}&s={s_str}&fn={fn}&i={fd}&fp={fp}&n={n_type}"
+        logger.info(f"✅ Сформирован QR вручную: {qrraw}")
+        return qrraw
 
     except Exception as e:
-        logger.error(f"Ошибка в confirm_manual_api: {str(e)}, data={data}")
-        return False, f"⚠️ Внутренняя ошибка: {str(e)}. Обратитесь к админу.", None
+        logger.error(f"Ошибка при формировании QR вручную: {e}")
+        return None
+
+
+# ==================== 3. Единая обработка через API ====================
+
+import aiohttp
+import asyncio
+import json
+import time
+import logging
+from typing import Optional, Tuple, Dict, Any
+from config import PROVERKACHEKA_TOKEN
+
+logger = logging.getLogger("AccountingBot")
+PROVERKA_API_URL = "https://proverkacheka.com/api/v1/check/get"
+
+
+async def process_check_from_qrraw(qrraw: str, user_id: Optional[int] = None) -> Tuple[bool, str, Optional[Dict]]:
+    """
+    Универсальная функция: принимает qrraw, запрашивает API и возвращает результат.
+    """
+    timeout = aiohttp.ClientTimeout(total=30)
+    max_retries = 3
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                payload = {"token": PROVERKACHEKA_TOKEN, "qrraw": qrraw}
+                async with session.post(PROVERKA_API_URL, json=payload) as response:
+                    text = await response.text()
+                    logger.info(f"[API] HTTP {response.status}: {text[:200]}...")
+
+                    if response.status != 200:
+                        return False, f"❌ Ошибка HTTP {response.status}", None
+
+                    result = json.loads(text)
+                    code = result.get("code")
+
+                    # ✅ Успешный ответ
+                    if code == 1:
+                        data_json = result.get("data", {}).get("json", {})
+                        if not data_json:
+                            return False, "❌ Нет данных JSON в ответе API.", None
+
+                        # Извлекаем товары
+                        items = [
+                            {
+                                "name": i.get("name", "Товар"),
+                                "sum": i.get("sum", 0) / 100.0,
+                                "price": i.get("price", 0) / 100.0,
+                                "quantity": i.get("quantity", 1),
+                            }
+                            for i in data_json.get("items", [])
+                        ]
+
+                        parsed = {
+                            "store": data_json.get("user", "Неизвестно"),
+                            "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
+                            "items": items,
+                            "total_sum": data_json.get("totalSum", 0) / 100.0,
+                            "fiscal_doc": str(data_json.get("fiscalDocumentNumber", "")),
+                            "fiscal_sign": str(data_json.get("fiscalSign", "")),
+                            "fiscal_drive": str(data_json.get("fiscalDriveNumber", "")),
+                            "operation_type": data_json.get("operationType"),
+                            "qr_string": qrraw,
+                        }
+
+                        logger.info(
+                            f"✅ Успешно получен чек (fiscal_doc={parsed['fiscal_doc']}, "
+                            f"total_sum={parsed['total_sum']:.2f}, items={len(items)})"
+                        )
+                        return True, "✅ Чек успешно получен.", parsed
+
+                    # 🔁 Прочие коды ошибок
+                    elif code == 2:
+                        return False, "⏳ Чек ещё обрабатывается. Повторите позже.", None
+                    elif code == 3:
+                        if attempt < max_retries:
+                            logger.warning("Превышен лимит запросов. Повтор через 60 секунд...")
+                            time.sleep(60)
+                            continue
+                        return False, "❌ Превышен лимит запросов API.", None
+                    elif code == 4:
+                        wait = result.get("data", {}).get("wait", 5)
+                        if attempt < max_retries:
+                            logger.warning(f"Повтор через {wait} секунд...")
+                            time.sleep(wait)
+                            continue
+                        return False, f"❌ Подождите {wait} секунд перед повтором.", None
+                    else:
+                        msg = result.get("data", {}).get("message", f"Неизвестная ошибка (code={code})")
+                        return False, f"❌ Ошибка API: {msg}", None
+
+        except aiohttp.ClientTimeout:
+            if attempt < max_retries:
+                logger.warning(f"⏳ Таймаут. Повтор {attempt}/{max_retries}")
+                await asyncio.sleep(5)
+                continue
+            return False, "❌ Таймаут запроса.", None
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка process_check_from_qrraw: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(3)
+                continue
+            return False, f"⚠️ Ошибка: {str(e)}", None
+
+    return False, "❌ Не удалось получить чек после 3 попыток.", None
+
+
+
 
 OP_TYPE_MAPPING = {
     "приход": 1,

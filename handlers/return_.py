@@ -14,7 +14,7 @@ from sheets import (
     SHEET_NAME,
     get_monthly_balance,
 )
-from utils import parse_qr_from_photo, safe_float, reset_keyboard
+from utils import parse_qr_from_photo, safe_float, reset_keyboard, build_qr_from_manual, process_check_from_qrraw
 from config import SHEET_NAME
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
@@ -24,10 +24,12 @@ logger = logging.getLogger("AccountingBot")
 return_router = Router()
 
 class ReturnReceipt(StatesGroup):
-    ENTER_SEARCH_TERM = State()  # ✅ НОВОЕ: Гибкий поиск (fiscal или имя)
+    ENTER_SEARCH_TERM = State()
     SELECT_ITEM = State()
     UPLOAD_RETURN_QR = State()
+    MANUAL_ENTRY = State()   # ✅ новое состояние
     CONFIRM_ACTION = State()
+
 
 @return_router.message(Command("return"))
 async def return_receipt(message: Message, state: FSMContext):
@@ -209,9 +211,21 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
 
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed_data:
-        await loading_message.edit_text("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=None)  # ✅ ФИКС
-        logger.info(f"Ошибка обработки QR-кода для возврата: user_id={message.from_user.id}")
+        await loading_message.delete()
+        await message.answer(
+            "❌ Не удалось распознать QR-код.\n"
+            "Введите данные вручную:\n\n"
+            "📄 Формат:\n"
+            "<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+            "Пример:\n"
+            "<code>9960440302201159 12345 6789012345 1500.00 28.10.2025 14:30</code>\n\n"
+            "Или /cancel чтобы выйти.",
+            parse_mode="HTML"
+        )
+        await state.set_state(ReturnReceipt.MANUAL_ENTRY)
+        logger.info(f"Переход в ручной ввод возврата: user_id={message.from_user.id}")
         return
+
 
     if parsed_data.get("operation_type") != 2:
         await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=None)  # ✅ ФИКС
@@ -285,6 +299,49 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
     )
     await state.set_state(ReturnReceipt.CONFIRM_ACTION)
     logger.info(f"Возврат готов к подтверждению: old_fiscal={fiscal_doc}, new_fiscal={new_fiscal_doc}, item={item_name}, total_return_sum={total_return_sum}, user_id={message.from_user.id}")
+
+
+@return_router.message(ReturnReceipt.MANUAL_ENTRY)
+async def handle_manual_return_entry(message: Message, state: FSMContext):
+    """
+    Обработка ручного ввода QR для возврата (если фото не распознано)
+    """
+    text = message.text.strip()
+    parts = text.split()
+
+    if len(parts) != 6:
+        await message.answer("⚠️ Формат неверный. Используй пример:\n<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode="HTML")
+        return
+
+    fn, fd, fp, s, date_str, time_str = parts
+    data = {
+        "fn": fn,
+        "fd": fd,
+        "fp": fp,
+        "s": s,
+        "date": date_str,
+        "time": time_str,
+        "op_type": 2  # ✅ Возврат
+    }
+
+    qr_raw = await build_qr_from_manual(data)
+    if not qr_raw:
+        await message.answer("❌ Не удалось сформировать QR. Проверьте ввод.")
+        return
+
+    await message.answer("⌛ Проверяю чек через API...")
+    success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
+
+    if not success or not parsed_data:
+        await message.answer(f"❌ Ошибка: {msg}")
+        await state.clear()
+        return
+
+    await message.answer("✅ Чек возврата получен успешно.")
+    await state.update_data(parsed_data=parsed_data)
+    await state.set_state(ReturnReceipt.CONFIRM_ACTION)
+    logger.info(f"Ручной ввод возврата успешен: fiscal={parsed_data.get('fiscal_doc')}, user={message.from_user.id}")
+
 
 @return_router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
