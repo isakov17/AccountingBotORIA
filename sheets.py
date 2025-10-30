@@ -56,8 +56,9 @@ def get_target_summary_sheet(date_str: str) -> str:
     purchase_month = dt.strftime("%m.%Y")
 
     if purchase_month == current_month:
-        return "Сводка!A:E"
-    return f"{get_archive_sheet_name(date_str)}!A:E"
+        return "Сводка"  # ✅ только название листа!
+    return get_archive_sheet_name(date_str)
+
 
 async def async_sheets_call(method_callable, *args, **kwargs):
     loop = asyncio.get_event_loop()
@@ -151,152 +152,152 @@ async def save_receipt(
     operation_type: int | None = None,
     **kwargs
 ) -> bool:
+    """Сохраняет чек: товары → Чеки, всё → Сводка"""
     if data_or_parsed is None:
         data_or_parsed = kwargs.get("parsed_data") or kwargs.get("receipt")
 
     try:
         data = data_or_parsed or {}
-        if not isinstance(data, dict) or not data.get("items"):
-            logger.error(f"save_receipt: нет товаров для сохранения, user={user_name}")
+
+        items = data.get("items", [])
+        if not items:
+            logger.error("save_receipt: нет товаров для сохранения")
             return False
 
-        fiscal_doc = data.get("fiscal_doc", "")
-        store = data.get("store", "Неизвестно")
+        fiscal_doc = str(data.get("fiscal_doc", "")).strip()
         raw_date = data.get("date") or datetime.now().strftime("%Y.%m.%d")
         qr_string = data.get("qr_string", "")
-        status = data.get("status", "Доставлено" if receipt_type in ("Покупка", "Полный") else "Ожидает")
+        store = data.get("store", "Неизвестно")
         customer = data.get("customer", customer or "Неизвестно")
         delivery_dates = data.get("delivery_dates", [])
         links = data.get("links", []) or []
         comments = data.get("comments", []) or []
         type_for_sheet = data.get("receipt_type", receipt_type)
+        
+        # ✅ ПОЛУЧАЕМ СТАТУС ИЗ ДАННЫХ ЧЕКА
+        status = data.get("status", "Доставлено")  # По умолчанию "Доставлено", но может быть "Ожидает"
 
-        date_for_sheet = normalize_date(raw_date)
         added_at = datetime.now().strftime("%d.%m.%Y")
+        date_for_sheet = normalize_date(raw_date)
 
+        # ✅ ИСПОЛЬЗУЕМ УЖЕ ВЫЧИСЛЕННЫЕ ДАННЫЕ ИЗ ПАРСИНГА
+        excluded_items = data.get("excluded_items", [])
+        excluded_sum = safe_float(data.get("excluded_sum", 0))
+        
         rows_checks = []
-        rows_summary = []  # Для сводки
+        rows_summary = []
 
-        items = data.get("items", [])
         for i, item in enumerate(items):
-            item_name = item.get("name", "Неизвестно")
-            item_sum = float(safe_float(item.get("sum", 0)))
-            item_qty = float(safe_float(item.get("quantity", 1))) or 1.0
-            item_price = float(safe_float(item.get("price", 0))) or (item_sum / item_qty if item_qty else 0.0)
+            name = item.get("name", "—").strip()
+            qty = float(safe_float(item.get("quantity", 1))) or 1.0
+            sum_val = float(safe_float(item.get("sum", 0)))
+            price = float(safe_float(item.get("price", sum_val / qty)))
 
-            item_link = (links[i] if i < len(links) else "") or item.get("link", "")
-            item_comment = (comments[i] if i < len(comments) else "") or item.get("comment", "")
+            link = links[i] if i < len(links) else item.get("link", "")
+            comment = comments[i] if i < len(comments) else item.get("comment", "")
+            delivery = delivery_dates[i] if i < len(delivery_dates) else ""
 
-            row = [
-                added_at,  # A
-                date_for_sheet,  # B
-                item_sum,  # C
-                item_price,  # D
-                item_qty,  # E
-                user_name,  # F
-                store,  # G
-                delivery_dates[i] if i < len(delivery_dates) else "",  # H
-                status,  # I
-                customer,  # J
-                item_name,  # K
-                type_for_sheet,  # L
-                str(fiscal_doc),  # M
-                qr_string,  # N
-                "",  # O
-                item_link,  # P
-                item_comment  # Q
-            ]
-            rows_checks.append(row)
+            # ❌ Пропускаем исключённые товары (они НЕ попадают в Чеки)
+            if item.get("excluded", False):
+                continue
 
-            rows_summary.append([
-                date_for_sheet,
-                "Покупка" if type_for_sheet in ("Покупка", "Полный") else type_for_sheet,
-                0.0,
-                abs(item_sum),
-                f"{fiscal_doc} - {item_name}"
+            # ✅ Реальные товары → Чеки (ИСПОЛЬЗУЕМ СТАТУС ИЗ ДАННЫХ ЧЕКА)
+            rows_checks.append([
+                added_at, date_for_sheet,
+                sum_val, price, qty,
+                user_name, store, delivery,
+                status,  # ✅ ВМЕСТО "Доставлено" - используем статус из данных
+                customer, name, type_for_sheet,
+                fiscal_doc, qr_string, "",
+                link, comment
             ])
 
-        excluded_sum = float(safe_float(data.get("excluded_sum", 0)))
-        if excluded_sum > 0:
+            # ✅ В сводку как расход
             rows_summary.append([
                 date_for_sheet,
-                "Услуга",
+                "Покупка",
                 0.0,
-                excluded_sum,
-                f"{fiscal_doc} - Исключённые: {', '.join(data.get('excluded_items', []))}"
+                abs(sum_val),
+                f"{fiscal_doc} - {name}"
             ])
 
-        # Чеки всегда в один лист
-        await async_sheets_call(
-            sheets_service.spreadsheets().values().append,
-            spreadsheetId=SHEET_NAME,
-            range="Чеки!A:Q",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows_checks}
-        )
+        # ✅ ДОБАВЛЯЕМ ИСКЛЮЧЁННЫЕ ТОВАРЫ В СВОДКУ КАК УСЛУГИ
+        if excluded_items:
+            for excluded_item in excluded_items:
+                rows_summary.append([
+                    date_for_sheet,  # Дата операции
+                    "Услуга",        # Тип
+                    0.0,             # Приход
+                    abs(excluded_sum),  # Расход (используем общую сумму исключённых)
+                    f"{fiscal_doc} - Исключено: {excluded_item}"
+                ])
 
-        # Сводка — в текущий или архивный лист
-        if rows_summary:
-            target_sheet = get_target_summary_sheet(date_for_sheet)
+        # ✅ Чеки → Вставляем строки
+        if rows_checks:
             await async_sheets_call(
                 sheets_service.spreadsheets().values().append,
                 spreadsheetId=SHEET_NAME,
-                range=target_sheet,
+                range="Чеки",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows_checks}
+            )
+
+        # ✅ Сводка
+        if rows_summary:
+            target_sheet = get_target_summary_sheet(date_for_sheet)
+
+            await async_sheets_call(
+                sheets_service.spreadsheets().values().append,
+                spreadsheetId=SHEET_NAME,
+                range=f"{target_sheet}!A:A",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": rows_summary}
             )
-            logger.debug(f"Appended {len(rows_summary)} summary rows to {target_sheet}")
 
-        logger.info(f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, позиций={len(rows_checks)}, user={user_name}")
-        return True
+            logger.info(f"📌 Добавлено {len(rows_summary)} строк в сводку → {target_sheet}")
+            logger.info(
+                f"✅ Чек сохранён: fiscal_doc={fiscal_doc}, "
+                f"товаров={len(rows_checks)}, исключено={len(excluded_items)}, статус={status}, user={user_name}"
+            )
+            return True
 
     except Exception as e:
-        logger.error(f"❌ Ошибка сохранения чека: {e}, user={user_name}")
+        logger.error(f"❌ Ошибка save_receipt: {e}")
         return False
 
+
 async def save_receipt_summary(date: str, operation_type: str, sum_value: float, note: str):
-    """Append only data row for formulas (no fixed updates)."""
-    logger.debug(f"Summary append: {sum_value}, type: {operation_type}")
+    """Добавляет одиночную строку в сводку."""
     try:
-        formatted_date = normalize_date(date)
-        adjusted_value = float(abs(sum_value))
+        date_fmt = normalize_date(date)
+        amount = abs(float(safe_float(sum_value)))
 
         if operation_type == "Возврат":
-            income, expense = adjusted_value, 0.0
-        elif operation_type == "Услуга":
-            income, expense = 0.0, adjusted_value
+            income, expense = amount, 0.0
         else:
-            income, expense = 0.0, adjusted_value
+            income, expense = 0.0, amount
 
-        summary_row = [
-            formatted_date,
-            operation_type,
-            income,
-            expense,
-            note
-        ]
+        row = [date_fmt, operation_type, income, expense, note]
 
-        target_sheet = get_target_summary_sheet(formatted_date)
+        target_sheet = get_target_summary_sheet(date_fmt)
         await async_sheets_call(
             sheets_service.spreadsheets().values().append,
             spreadsheetId=SHEET_NAME,
             range=target_sheet,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": [summary_row]}
+            body={"values": [row]}
         )
+        logger.info(f"📊 Сводка: добавлена строка → {operation_type} {amount:.2f}")
 
-        logger.debug(f"Summary row appended to {target_sheet}: {summary_row[:2]}...")
         return True
 
-    except HttpError as e:
-        logger.error(f"Ошибка append summary: {e.status_code} - {e.reason}")
-        raise
     except Exception as e:
-        logger.error(f"Ошибка summary: {str(e)}")
-        raise
+        logger.error(f"❌ Ошибка save_receipt_summary: {e}")
+        return False
+
 
 def normalize_amount(value: str) -> float:
     if not value:

@@ -79,40 +79,50 @@ def safe_float(value: str | float | int, default: float = 0.0) -> float:
 
 async def parse_qr_from_photo(bot, file_id: str) -> dict | None:
     """
-    Получает file_id фото от Telegram, скачивает его,
-    парсит QR-код и отправляет на API proverkacheka.com.
-    Возвращает dict с данными чека или None.
+    Загружает фото с Telegram, распознаёт QR и отправляет в API.
+    Возвращает dict или None.
     """
     try:
-        # 1️⃣ Скачиваем файл
+        # 1️⃣ Скачиваем изображение корректно
         file = await bot.get_file(file_id)
-        file_bytes = await bot.download_file(file.file_path)
-        image_data = np.asarray(bytearray(file_bytes.read()), dtype=np.uint8)
-        image = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+        file_stream = await bot.download_file(file.file_path)
 
-        # 2️⃣ Пытаемся распознать QR
+        file_bytes = file_stream.read()
+        if not file_bytes:
+            logger.error("Не удалось прочитать байты изображения.")
+            return None
+
+        # 2️⃣ Декодирование в OpenCV
+        image_array = np.frombuffer(file_bytes, np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if image is None:
+            logger.error("cv2.imdecode вернул None — неверный формат изображения.")
+            return None
+
+        # 3️⃣ Поиск QR
         decoded = decode(image)
         if not decoded:
             logger.warning("QR-код не найден на изображении.")
             return None
 
         qr_raw = decoded[0].data.decode("utf-8").strip()
-        logger.info(f"✅ Распознан QR: {qr_raw}")
+        logger.info(f"✅ QR распознан: {qr_raw}")
 
-        # 3️⃣ Передаем QR в универсальную обработку
-        success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
+        # 4️⃣ Универсальный запрос
+        success, msg, parsed = await process_check_from_qrraw(qr_raw)
 
-        if not success:
-            logger.error(f"Ошибка при обработке QR: {msg}")
+        if not success or not parsed:
+            logger.error(f"❌ Ошибка при обработке QR: {msg}")
             return None
 
-        # 4️⃣ Возвращаем итоговый словарь
-        parsed_data["qr_string"] = qr_raw
-        parsed_data["fiscal_doc"] = parsed_data.get("fiscal_doc") or "N/A"
-        return parsed_data
+        parsed["qr_string"] = qr_raw
+        parsed["fiscal_doc"] = parsed.get("fiscal_doc") or "N/A"
 
-    except Exception as e:
-        logger.error(f"Ошибка в parse_qr_from_photo: {e}")
+        return parsed
+
+    except Exception as e:  # ✅ теперь ловим только корректные исключения
+        logger.exception(f"❌ ИСКЛЮЧЕНИЕ в parse_qr_from_photo: {e}")
         return None
 
 
@@ -203,57 +213,82 @@ async def process_check_from_qrraw(qrraw: str, user_id: Optional[int] = None) ->
                     result = json.loads(text)
                     code = result.get("code")
 
-                    # ✅ Успешный ответ
                     if code == 1:
                         data_json = result.get("data", {}).get("json", {})
+
                         if not data_json:
                             return False, "❌ Нет данных JSON в ответе API.", None
 
-                        # Извлекаем товары
-                        items = [
-                            {
-                                "name": i.get("name", "Товар"),
-                                "sum": i.get("sum", 0) / 100.0,
-                                "price": i.get("price", 0) / 100.0,
-                                "quantity": i.get("quantity", 1),
+                        from exceptions import is_excluded
+
+                        items_raw = data_json.get("items", [])
+                        items = []
+
+                        excluded_sum = 0.0
+                        excluded_items_list = []
+
+                        # ✅ Важно: добавляем все товары
+                        for i in items_raw:
+                            name = i.get("name", "Товар").strip()
+                            sum_value = i.get("sum", 0) / 100.0
+                            price = i.get("price", 0) / 100.0
+                            qty = i.get("quantity", 1)
+
+                            item_is_excluded = is_excluded(name)
+
+                            # ✅ Маркируем товар
+                            item = {
+                                "name": name,
+                                "sum": sum_value,
+                                "price": price,
+                                "quantity": qty,
+                                "excluded": item_is_excluded,
                             }
-                            for i in data_json.get("items", [])
-                        ]
+
+                            if item_is_excluded:
+                                excluded_sum += sum_value
+                                excluded_items_list.append(name)
+
+                            items.append(item)
 
                         parsed = {
                             "store": data_json.get("user", "Неизвестно"),
                             "date": data_json.get("dateTime", "").split("T")[0].replace("-", "."),
-                            "items": items,
+                            "items": items,  # ✅ Все товары остаются здесь
                             "total_sum": data_json.get("totalSum", 0) / 100.0,
                             "fiscal_doc": str(data_json.get("fiscalDocumentNumber", "")),
                             "fiscal_sign": str(data_json.get("fiscalSign", "")),
                             "fiscal_drive": str(data_json.get("fiscalDriveNumber", "")),
                             "operation_type": data_json.get("operationType"),
                             "qr_string": qrraw,
+                            "excluded_items": excluded_items_list,
+                            "excluded_sum": round(excluded_sum, 2),
                         }
 
                         logger.info(
-                            f"✅ Успешно получен чек (fiscal_doc={parsed['fiscal_doc']}, "
-                            f"total_sum={parsed['total_sum']:.2f}, items={len(items)})"
+                            f"✅ Успешно получен чек "
+                            f"(fiscal_doc={parsed['fiscal_doc']}, total_sum={parsed['total_sum']:.2f}, "
+                            f"items_all={len(items)}, excluded={len(excluded_items_list)}, excluded_sum={excluded_sum:.2f})"
                         )
+
                         return True, "✅ Чек успешно получен.", parsed
 
-                    # 🔁 Прочие коды ошибок
                     elif code == 2:
                         return False, "⏳ Чек ещё обрабатывается. Повторите позже.", None
                     elif code == 3:
                         if attempt < max_retries:
                             logger.warning("Превышен лимит запросов. Повтор через 60 секунд...")
-                            time.sleep(60)
+                            await asyncio.sleep(60)
                             continue
                         return False, "❌ Превышен лимит запросов API.", None
                     elif code == 4:
                         wait = result.get("data", {}).get("wait", 5)
                         if attempt < max_retries:
                             logger.warning(f"Повтор через {wait} секунд...")
-                            time.sleep(wait)
+                            await asyncio.sleep(wait)
                             continue
                         return False, f"❌ Подождите {wait} секунд перед повтором.", None
+
                     else:
                         msg = result.get("data", {}).get("message", f"Неизвестная ошибка (code={code})")
                         return False, f"❌ Ошибка API: {msg}", None
@@ -264,6 +299,7 @@ async def process_check_from_qrraw(qrraw: str, user_id: Optional[int] = None) ->
                 await asyncio.sleep(5)
                 continue
             return False, "❌ Таймаут запроса.", None
+
         except Exception as e:
             logger.error(f"⚠️ Ошибка process_check_from_qrraw: {e}")
             if attempt < max_retries:
@@ -272,6 +308,7 @@ async def process_check_from_qrraw(qrraw: str, user_id: Optional[int] = None) ->
             return False, f"⚠️ Ошибка: {str(e)}", None
 
     return False, "❌ Не удалось получить чек после 3 попыток.", None
+
 
 
 

@@ -221,6 +221,17 @@ async def process_receipt_type(callback: CallbackQuery, state: FSMContext) -> No
         logger.error(f"Нет товаров в чеке: fiscal_doc={parsed_data.get('fiscal_doc', '')}, user_id={callback.from_user.id}")
         return
 
+    # ✅ ПРОПУСКАЕМ ИСКЛЮЧЁННЫЕ ТОВАРЫ В НАЧАЛЕ
+    while items and items[0].get("excluded", False):
+        del items[0]
+        parsed_data["items"] = items
+        await state.update_data(parsed_data=parsed_data)
+
+    if not items:
+        await callback.message.answer("⚠️ Нет подходящих товаров. Все позиции — услуги.")
+        await state.clear()
+        return
+
     total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
     items_list = "\n".join([
         f"- {item.get('name', '—')} "
@@ -242,8 +253,6 @@ async def process_receipt_type(callback: CallbackQuery, state: FSMContext) -> No
             await state.update_data(current_item_index=0)
             await state.set_state(AddReceiptQR.WAIT_LINK)
 
-        # Удалено else: (no items already returned)
-
     elif callback.data == "type_delivery":
         receipt_type = "Предоплата"
         await state.update_data(receipt_type=receipt_type, delivery_dates=[], links=[], comments=[])
@@ -256,6 +265,83 @@ async def process_receipt_type(callback: CallbackQuery, state: FSMContext) -> No
         await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         logger.info(f"Выбрана доставка: fiscal_doc={parsed_data.get('fiscal_doc', '')}, user_id={callback.from_user.id}")
 
+# ✅ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ЗАВЕРШЕНИЯ
+async def finish_items_input(message: Message, state: FSMContext, items: list):
+    data = await state.get_data()
+    parsed_data = data.get("parsed_data", {})
+    delivery_dates = data.get("delivery_dates", [])
+    links = data.get("links", [])
+    comments = data.get("comments", [])
+    receipt_type = data.get("receipt_type", "Покупка")
+
+    # Фильтруем только НЕисключённые товары для отображения
+    non_excluded_items = [item for item in items if not item.get("excluded", False)]
+    total_sum = sum(safe_float(item.get("sum", 0)) for item in non_excluded_items)
+
+    rows = []
+    for i, item in enumerate(items):
+        if item.get("excluded", False):
+            continue
+        d = delivery_dates[i] if i < len(delivery_dates) else ""
+        l = links[i] if i < len(links) else ""
+        c = comments[i] if i < len(comments) else ""
+        rows.append(
+            f"- {item.get('name', '—')} "
+            f"(Сумма: {safe_float(item.get('sum', 0)):.2f} RUB, "
+            f"Цена: {safe_float(item.get('price', 0)):.2f} RUB, "
+            f"Кол-во: {item.get('quantity', 1)}, "
+            f"Доставка: {d or '—'}, "
+            f"Ссылка: {l or '—'}, "
+            f"Комментарий: {c or '—'})"
+        )
+
+    receipt = {
+        "date": parsed_data.get("date"),
+        "store": parsed_data.get("store", "Неизвестно"),
+        "items": [
+            {
+                "name": item.get("name", "—"),
+                "sum": safe_float(item.get("sum", 0)),
+                "price": safe_float(item.get("price", 0)),
+                "quantity": item.get("quantity", 1),
+                "link": links[i] if i < len(links) else "",
+                "comment": comments[i] if i < len(comments) else ""
+            }
+            for i, item in enumerate(items)
+            if not item.get("excluded", False)  # ✅ Только неисключённые в items чека
+        ],
+        "receipt_type": receipt_type,
+        "fiscal_doc": parsed_data.get("fiscal_doc", ""),
+        "qr_string": parsed_data.get("qr_string", ""),
+        "delivery_dates": delivery_dates,
+        "links": links,
+        "comments": comments,
+        "status": "Ожидает" if receipt_type == "Предоплата" else "Доставлено",
+        "customer": data.get("customer", "Неизвестно")
+    }
+
+    # ✅ Сохраняем excluded_sum и excluded_items для sheets.py
+    receipt["excluded_sum"] = safe_float(parsed_data.get("excluded_sum", 0))
+    receipt["excluded_items"] = parsed_data.get("excluded_items", [])
+
+    details = (
+        f"Детали чека:\n"
+        f"Магазин: {receipt['store']}\n"
+        f"Заказчик: {receipt['customer']}\n"
+        f"Сумма: {total_sum:.2f} RUB\n"
+        f"Товары:\n" + "\n".join(rows) + "\n"
+        f"Фискальный номер: {receipt['fiscal_doc']}"
+    )
+
+    inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
+        [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
+    ])
+    await message.answer(details, reply_markup=inline_keyboard)
+    await message.answer("Или сбросьте действие:", reply_markup=reset_keyboard())
+    await state.update_data(receipt=receipt)
+    await state.set_state(AddReceiptQR.CONFIRM_ACTION)
+
 @add_router.message(AddReceiptQR.CONFIRM_DELIVERY_DATE)
 async def process_delivery_date(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
@@ -266,6 +352,14 @@ async def process_delivery_date(message: Message, state: FSMContext) -> None:
     current_item_index = data.get("current_item_index", 0)
     delivery_dates = data.get("delivery_dates", [])
     links = data.get("links", [])
+
+    # ✅ ПРОПУСКАЕМ ИСКЛЮЧЁННЫЕ ТОВАРЫ
+    while current_item_index < len(items) and items[current_item_index].get("excluded", False):
+        current_item_index += 1
+        await state.update_data(current_item_index=current_item_index)
+
+    if current_item_index >= len(items):
+        return await finish_items_input(message, state, items)
 
     if message.text == "/skip":
         delivery_date = ""
@@ -311,6 +405,19 @@ async def process_delivery_date(message: Message, state: FSMContext) -> None:
 
 @add_router.message(AddReceiptQR.WAIT_LINK)
 async def process_receipt_link(message: Message, state: FSMContext) -> None:
+    # ✅ ПРОПУСКАЕМ ИСКЛЮЧЁННЫЕ ТОВАРЫ
+    data = await state.get_data()
+    parsed_data = data.get("parsed_data", {})
+    items = parsed_data.get("items", [])
+    current_item_index = data.get("current_item_index", 0)
+
+    while current_item_index < len(items) and items[current_item_index].get("excluded", False):
+        current_item_index += 1
+        await state.update_data(current_item_index=current_item_index)
+
+    if current_item_index >= len(items):
+        return await finish_items_input(message, state, items)
+
     link = (message.text or "").strip()
 
     if link != "/skip" and not (link.startswith("http://") or link.startswith("https://")):
@@ -320,10 +427,6 @@ async def process_receipt_link(message: Message, state: FSMContext) -> None:
         )
         return
 
-    data = await state.get_data()
-    parsed_data = data.get("parsed_data", {})
-    items = parsed_data.get("items", [])
-    current_item_index = data.get("current_item_index", 0)
     links = data.get("links", [])
 
     link = "" if link == "/skip" else link
@@ -345,15 +448,24 @@ async def process_receipt_link(message: Message, state: FSMContext) -> None:
 
 @add_router.message(AddReceiptQR.WAIT_COMMENT)
 async def process_receipt_comment(message: Message, state: FSMContext) -> None:
+    # ✅ ПРОПУСКАЕМ ИСКЛЮЧЁННЫЕ ТОВАРЫ
+    data = await state.get_data()
+    parsed_data = data.get("parsed_data", {})
+    items = parsed_data.get("items", [])
+    current_item_index = data.get("current_item_index", 0)
+
+    while current_item_index < len(items) and items[current_item_index].get("excluded", False):
+        current_item_index += 1
+        await state.update_data(current_item_index=current_item_index)
+
+    if current_item_index >= len(items):
+        return await finish_items_input(message, state, items)
+
     comment = (message.text or "").strip()
     if comment == "/skip":
         comment = ""
 
-    data = await state.get_data()
-    parsed_data = data.get("parsed_data", {})
-    items = parsed_data.get("items", [])
     receipt_type = data.get("receipt_type", "Покупка")
-    current_item_index = data.get("current_item_index", 0)
     comments = data.get("comments", [])
 
     while len(comments) < current_item_index:
@@ -365,12 +477,15 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
 
     await state.update_data(comments=comments)
 
-    if current_item_index + 1 < len(items):
-        next_index = current_item_index + 1
+    # Ищем следующий НЕисключённый товар
+    next_index = current_item_index + 1
+    while next_index < len(items) and items[next_index].get("excluded", False):
+        next_index += 1
+
+    if next_index < len(items):
         await state.update_data(current_item_index=next_index)
 
         if receipt_type == "Полный":
-            # Сначала спрашиваем ссылку для следующего товара
             await message.answer(
                 f"📎 Пришлите ссылку на «{items[next_index].get('name', '—')}» "
                 f"(например: https://www.ozon.ru/...).",
@@ -387,74 +502,8 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
             await state.set_state(AddReceiptQR.CONFIRM_DELIVERY_DATE)
         return
 
-
     # Все обработано
-    total_sum = sum(safe_float(item.get("sum", 0)) for item in items)
-    delivery_dates = data.get("delivery_dates", [])
-    links = data.get("links", [])
-    comments = data.get("comments", [])
-
-    rows = []
-    for i, item in enumerate(items):
-        d = delivery_dates[i] if i < len(delivery_dates) else ""
-        l = links[i] if i < len(links) else ""
-        c = comments[i] if i < len(comments) else ""
-        rows.append(
-            f"- {item.get('name', '—')} "
-            f"(Сумма: {safe_float(item.get('sum', 0)):.2f} RUB, "
-            f"Цена: {safe_float(item.get('price', 0)):.2f} RUB, "
-            f"Кол-во: {item.get('quantity', 1)}, "
-            f"Доставка: {d or '—'}, "
-            f"Ссылка: {l or '—'}, "
-            f"Комментарий: {c or '—'})"
-        )
-
-    receipt = {
-        "date": parsed_data.get("date"),
-        "store": parsed_data.get("store", "Неизвестно"),
-        "items": [
-            {
-                "name": item.get("name", "—"),
-                "sum": safe_float(item.get("sum", 0)),
-                "price": safe_float(item.get("price", 0)),
-                "quantity": item.get("quantity", 1),
-                "link": links[i] if i < len(links) else "",
-                "comment": comments[i] if i < len(comments) else ""
-            }
-            for i, item in enumerate(items)
-        ],
-        "receipt_type": receipt_type,
-        "fiscal_doc": parsed_data.get("fiscal_doc", ""),
-        "qr_string": parsed_data.get("qr_string", ""),
-        "delivery_dates": delivery_dates,
-        "links": links,
-        "comments": comments,
-        "status": "Ожидает" if receipt_type == "Предоплата" else "Доставлено",
-        "customer": data.get("customer", "Неизвестно")
-    }
-
-    # ✅ НОВОЕ: Копируем excluded_sum и excluded_items из parsed_data в receipt
-    # Это позволит save_receipt в sheets.py правильно добавить строку "Услуга" в Сводку
-    receipt["excluded_sum"] = safe_float(parsed_data.get("excluded_sum", 0))
-    receipt["excluded_items"] = parsed_data.get("excluded_items", [])
-
-    details = (
-        f"Детали чека:\n"
-        f"Магазин: {receipt['store']}\n"
-        f"Заказчик: {receipt['customer']}\n"
-        f"Сумма: {total_sum:.2f} RUB\n"
-        f"Товары:\n" + "\n".join(rows) + "\n"
-        f"Фискальный номер: {receipt['fiscal_doc']}"
-    )
-
-    inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_add")],
-        [InlineKeyboardButton(text="Отменить", callback_data="cancel_add")]
-    ])
-    await message.answer(details, reply_markup=inline_keyboard)
-    await message.answer("Или сбросьте действие:", reply_markup=reset_keyboard())
-    await state.update_data(receipt=receipt)
-    await state.set_state(AddReceiptQR.CONFIRM_ACTION)
+    await finish_items_input(message, state, items)
 
 @add_router.callback_query(AddReceiptQR.CONFIRM_ACTION, lambda c: c.data == "confirm_add")
 async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None:
@@ -499,7 +548,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
                 "comment": receipt.get("comments", [None])[i] if i < len(receipt.get("comments", [])) else "",
                 "delivery_date": deliv_date
             })
-
+        if excluded_sum > 0 and items_list:
+            items_list[0]["excluded_sum"] = excluded_sum
         # 🔔 Уведомление в группу
         await send_notification(
             bot=callback.bot,

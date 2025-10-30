@@ -60,13 +60,24 @@ async def send_notification(
             for it in normalized_items
         )
 
+        excluded_sum = safe_float(next((it.get("excluded_sum", 0.0) for it in items if "excluded_sum" in it), 0.0))
+        full_total_sum = total_sum + excluded_sum
+
+        extra_text = ""
+        if excluded_sum > 0:
+            extra_text = (
+                f"\n🚫 <b>Исключённые услуги:</b> {excluded_sum:.2f} ₽"
+                f"\n🔹 <b>Полная сумма чека:</b> {full_total_sum:.2f} ₽"
+            )
+
         text = (
             f"<b>{action}</b>\n\n"
             f"👤 Пользователь: <b>{user_name}</b>\n"
             f"🧾 Фискальный номер: <code>{fiscal_doc}</code>\n"
             f"📅 Дата операции: {operation_date or datetime.now().strftime('%d.%m.%Y')}\n\n"
             f"{items_text}\n"
-            f"💰 <b>Итого:</b> {total_sum:.2f} ₽\n"
+            f"💰 <b>Итого (товары):</b> {total_sum:.2f} ₽"
+            f"{extra_text}\n"
             f"💳 <b>Баланс:</b> {balance:.2f} ₽"
         )
 

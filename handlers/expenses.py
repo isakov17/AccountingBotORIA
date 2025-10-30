@@ -268,13 +268,17 @@ async def upload_full_qr(message: Message, state: FSMContext, bot: Bot) -> None:
 @expenses_router.message(ConfirmDelivery.MANUAL_ENTRY)
 async def handle_manual_expense_entry(message: Message, state: FSMContext):
     """
-    Обработка ручного ввода QR для расходов (если фото не распознано)
+    Обработка ручного ввода QR для подтверждения доставки расходов
     """
     text = message.text.strip()
     parts = text.split()
 
     if len(parts) != 6:
-        await message.answer("⚠️ Формат неверный. Используй пример:\n<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode="HTML")
+        await message.answer(
+            "⚠️ Формат неверный.\n"
+            "<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+            parse_mode="HTML"
+        )
         return
 
     fn, fd, fp, s, date_str, time_str = parts
@@ -285,15 +289,16 @@ async def handle_manual_expense_entry(message: Message, state: FSMContext):
         "s": s,
         "date": date_str,
         "time": time_str,
-        "op_type": 1  # ✅ Полный расчёт
+        "op_type": 1
     }
+
+    await message.answer("⌛ Проверяю чек через API...")
 
     qr_raw = await build_qr_from_manual(data)
     if not qr_raw:
         await message.answer("❌ Не удалось сформировать QR. Проверьте ввод.")
         return
 
-    await message.answer("⌛ Проверяю чек через API...")
     success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
 
     if not success or not parsed_data:
@@ -301,10 +306,53 @@ async def handle_manual_expense_entry(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await message.answer("✅ Чек успешно найден и подтверждён.")
+    # ✅ Сохраняем данные чека в state
     await state.update_data(qr_parsed=parsed_data)
+
+    # ✅ Проверка позиций
+    data_state = await state.get_data()
+    items = data_state.get("items", [])
+    selected = sorted(list(data_state.get("selected", set())))
+    sel_items = [items[i] for i in selected]
+
+    qr_items = parsed_data.get("items", [])
+    missing = []
+    for it in sel_items:
+        need_name = _norm_name(it["name"])
+        matched = any(
+            SequenceMatcher(None, need_name, _norm_name(q.get("name", ""))).ratio() > 0.8
+            for q in qr_items
+        )
+        if not matched:
+            missing.append(it["name"])
+
+    if missing:
+        await message.answer(
+            "❌ Проверка провалена. Не найдены в QR:\n• " + "\n• ".join(missing),
+            reply_markup=reset_keyboard()
+        )
+        await state.clear()
+        return
+
+    # ✅ Формируем детали для вывода
+    total = sum(it["sum"] for it in sel_items)
+    details = [
+        f"Чек найден ✅",
+        f"fiscal_doc: {parsed_data.get('fiscal_doc')}",
+        f"Позиции подтверждены: {len(sel_items)} шт.",
+        f"Итого: {total:.2f} ₽"
+    ]
+
+    # ✅ Inline-кнопки для продолжения
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтвердить запись ✅", callback_data="confirm:delivery_many")],
+        [InlineKeyboardButton(text="Отмена", callback_data="confirm:cancel")]
+    ])
+
+    await message.answer("\n".join(details), reply_markup=kb)
+
     await state.set_state(ConfirmDelivery.CONFIRM_ACTION)
-    logger.info(f"Ручной ввод расходов успешен: fiscal={parsed_data.get('fiscal_doc')}, user={message.from_user.id}")
+    logger.info(f"Ручной ввод расходов успешно обработан: fiscal={parsed_data.get('fiscal_doc')}")
 
 
 @expenses_router.callback_query(ConfirmDelivery.CONFIRM_ACTION, F.data.in_(["confirm:delivery_many", "confirm:cancel"]))

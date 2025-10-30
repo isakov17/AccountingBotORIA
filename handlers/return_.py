@@ -19,9 +19,15 @@ from config import SHEET_NAME
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 from datetime import datetime
+from difflib import SequenceMatcher
+
 
 logger = logging.getLogger("AccountingBot")
 return_router = Router()
+
+def _norm_name(s: str) -> str:
+    s = (s or "").lower().strip()
+    return " ".join(s.split())
 
 class ReturnReceipt(StatesGroup):
     ENTER_SEARCH_TERM = State()
@@ -310,7 +316,11 @@ async def handle_manual_return_entry(message: Message, state: FSMContext):
     parts = text.split()
 
     if len(parts) != 6:
-        await message.answer("⚠️ Формат неверный. Используй пример:\n<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode="HTML")
+        await message.answer(
+            "⚠️ Формат неверный.\n"
+            "<code>FN FD FP СУММА ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+            parse_mode="HTML"
+        )
         return
 
     fn, fd, fp, s, date_str, time_str = parts
@@ -324,23 +334,62 @@ async def handle_manual_return_entry(message: Message, state: FSMContext):
         "op_type": 2  # ✅ Возврат
     }
 
+    await message.answer("⌛ Проверяю чек возврата...")
+
     qr_raw = await build_qr_from_manual(data)
     if not qr_raw:
-        await message.answer("❌ Не удалось сформировать QR. Проверьте ввод.")
+        await message.answer("❌ Не удалось сформировать QR.")
         return
 
-    await message.answer("⌛ Проверяю чек через API...")
     success, msg, parsed_data = await process_check_from_qrraw(qr_raw)
-
     if not success or not parsed_data:
         await message.answer(f"❌ Ошибка: {msg}")
         await state.clear()
         return
 
-    await message.answer("✅ Чек возврата получен успешно.")
+    # ✅ сохраняем и продолжаем
     await state.update_data(parsed_data=parsed_data)
+    qr_items = parsed_data.get("items", [])
+
+    data_state = await state.get_data()
+    item_name = data_state.get("item_name")
+    need_name = _norm_name(item_name)
+
+    # ✅ Сопоставление товара
+    matched = None
+    for q in qr_items:
+        if SequenceMatcher(None, need_name, _norm_name(q.get("name", ""))).ratio() > 0.8:
+            matched = q
+            break
+
+    if not matched:
+        await message.answer(
+            f"❌ Товар '{item_name}' не найден в чеке возврата.",
+            reply_markup=reset_keyboard()
+        )
+        await state.clear()
+        return
+
+    total_return_sum = matched.get("sum", 0.0)
+    await state.update_data(total_return_sum=total_return_sum)
+
+    details = [
+        "✅ Чек возврата подтверждён",
+        f"Фискальный документ: {parsed_data.get('fiscal_doc')}",
+        f"Товар: {item_name}",
+        f"Сумма возврата: {total_return_sum:.2f} ₽"
+    ]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтвердить возврат ↩️", callback_data="confirm_return")],
+        [InlineKeyboardButton(text="Отмена", callback_data="cancel_return")]
+    ])
+
+    await message.answer("\n".join(details), reply_markup=kb)
+
     await state.set_state(ReturnReceipt.CONFIRM_ACTION)
-    logger.info(f"Ручной ввод возврата успешен: fiscal={parsed_data.get('fiscal_doc')}, user={message.from_user.id}")
+    logger.info(f"Ручной ввод возврата готов к подтверждению: fiscal={parsed_data.get('fiscal_doc')}")
+
 
 
 @return_router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
