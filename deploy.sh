@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Путь к проекту
-PROJECT_DIR="/opt/projects/AccountingBotORIA"
+PROJECT_DIR="$HOME/project/AccountingBotORIA"
 VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
 SERVICE_NAME="accountingbot"
-BRANCH="main-refactor"
+BRANCH="main"
 
 echo "🚀 Обновление AccountingBotORIA..."
 

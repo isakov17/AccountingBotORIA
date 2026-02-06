@@ -133,16 +133,17 @@ async def process_search_term(message: Message, state: FSMContext):
         button_texts = []
         for i, m in enumerate(matches, 1):
             short_item = m['item'][:20] + '...' if len(m['item']) > 20 else m['item']
-            button_text = f"{short_item} (f {m['fiscal']}, d {m['date']})"
             button_texts.append(f"{i}. {short_item} (fiscal: {m['fiscal']}, дата: {m['date']})")
+
         inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=button_text,  # Компактно: "74-61-06 Гнездо пит.... (f 22713, d 04.09.2025)"
+                    text=f"{m['item'][:20] + '...' if len(m['item']) > 20 else m['item']} (f {m['fiscal']}, d {m['date']})",  # ✅ Создает текст прямо здесь для КАЖДОЙ кнопки!
                     callback_data=f"select_return_{m['fiscal']}_{m['row_index']}"
                 )
             ] for m in matches
         ])
+
         list_text = "\n".join(button_texts)  # Нумерованный список для деталей
         await message.answer(
             f"✅ Найдено {count} совпадений по '{search_term}'. Выберите товар:\n"
@@ -163,7 +164,7 @@ async def process_search_term(message: Message, state: FSMContext):
 @return_router.callback_query(ReturnReceipt.SELECT_ITEM)
 async def process_return_item(callback: CallbackQuery, state: FSMContext):
     try:
-        data_parts = callback.data.split("_", 2)  # select_return_{fiscal}_{index}
+        data_parts = callback.data.split("_")   # select_return_{fiscal}_{index}
         if len(data_parts) != 4 or data_parts[0] != "select" or data_parts[1] != "return":
             raise ValueError("Неверный callback")
 
@@ -339,7 +340,7 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 })
 
                 await save_receipt_summary(
-                    parsed_data.get("date", datetime.now().strftime("%d.%m.%Y")),
+                    date_purchase,  # ← Дата оригинальной покупки (январь)
                     "Возврат",
                     total_return_sum,
                     f"{new_fiscal_doc} - {item_name}"
