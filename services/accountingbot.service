@@ -1,0 +1,14 @@
+[Unit]
+Description=Accounting Bot
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+User=isakov-g2603  # Или khadas
+WorkingDirectory=/home/isakov-g2603/project/AccountingBotORIA
+ExecStart=/home/isakov-g2603/project/AccountingBotORIA/venv/bin/python /home/isakov-g2603/project/AccountingBotORIA/main.py
+Restart=always
+EnvironmentFile=/home/isakov-g2603/project/AccountingBotORIA/.env
+
+[Install]
+WantedBy=multi-user.target

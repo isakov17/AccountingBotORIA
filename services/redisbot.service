@@ -1,0 +1,22 @@
+[Unit]
+Description=Redis + Accounting Bot
+After=network.target
+Wants=redis-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/isakov-g2603/project/AccountingBotORIA  # Ваш путь!
+
+ExecStartPre=/bin/bash -c 'systemctl restart redis-server || systemctl start redis-server'
+ExecStart=/home/isakov-g2603/project/AccountingBotORIA/venv/bin/python /home/isakov-g2603/project/AccountingBotORIA/main.py
+ExecStop=/bin/bash -c 'systemctl stop redis-server || true'
+Restart=always
+RestartSec=10
+User=isakov-g2603
+EnvironmentFile=/home/isakov-g2603/project/AccountingBotORIA/.env
+# Permissions для Redis data если нужно
+ReadWritePaths=/var/lib/redis
+
+[Install]
+WantedBy=multi-user.target
