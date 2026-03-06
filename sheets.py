@@ -164,6 +164,11 @@ async def save_receipt(
         store = data.get("store", "Неизвестно")
         raw_date = data.get("date") or datetime.now().strftime("%Y.%m.%d")
         qr_string = data.get("qr_string", "")
+        
+        # ✅ НОВОЕ: Достаем ссылку на PDF (передали из parse_qr_from_photo или confirm_manual_api)
+        pdf_url = data.get("pdf_url", "")
+        qr_cell_value = f'=HYPERLINK("{pdf_url}"; "📄 Открыть PDF")'
+
         status = data.get("status", "Доставлено" if receipt_type in ("Покупка", "Полный") else "Ожидает")
         customer = data.get("customer", customer or "Неизвестно")
         delivery_dates = data.get("delivery_dates", [])
@@ -201,7 +206,7 @@ async def save_receipt(
                 item_name,  # K
                 type_for_sheet,  # L
                 str(fiscal_doc),  # M
-                qr_string,  # N
+                qr_cell_value,  # N  <-- ✅ ИЗМЕНЕНО: теперь здесь либо формула гиперссылки, либо qrraw
                 "",  # O
                 item_link,  # P
                 item_comment  # Q
@@ -231,7 +236,7 @@ async def save_receipt(
             sheets_service.spreadsheets().values().append,
             spreadsheetId=SHEET_NAME,
             range="Чеки!A:Q",
-            valueInputOption="RAW",
+            valueInputOption="USER_ENTERED", # ✅ ИЗМЕНЕНО: Обязательно "USER_ENTERED" вместо "RAW", чтобы сработала формула
             insertDataOption="INSERT_ROWS",
             body={"values": rows_checks}
         )
@@ -243,7 +248,7 @@ async def save_receipt(
                 sheets_service.spreadsheets().values().append,
                 spreadsheetId=SHEET_NAME,
                 range=target_sheet,
-                valueInputOption="RAW",
+                valueInputOption="RAW",  # Здесь можно оставить RAW, так как формул нет
                 insertDataOption="INSERT_ROWS",
                 body={"values": rows_summary}
             )

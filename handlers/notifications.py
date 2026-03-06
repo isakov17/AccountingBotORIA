@@ -28,7 +28,8 @@ async def send_notification(
     operation_date: str,
     balance: float,
     is_group: bool = False,
-    chat_id: int = None
+    chat_id: int = None,
+    pdf_url: str = ""
 ):
     """
     Универсальная функция отправки уведомления.
@@ -60,11 +61,15 @@ async def send_notification(
             for it in normalized_items
         )
 
+        # ✅ НОВОЕ: Формируем строку с ссылкой на чек, если она есть
+        receipt_link_text = f"\n📄 Чек (PDF): <a href=\"{pdf_url}\">Скачать / Открыть</a>" if pdf_url else ""
+
         text = (
             f"<b>{action}</b>\n\n"
             f"👤 Пользователь: <b>{user_name}</b>\n"
             f"🧾 Фискальный номер: <code>{fiscal_doc}</code>\n"
             f"📅 Дата операции: {operation_date or datetime.now().strftime('%d.%m.%Y')}\n\n"
+            f"{receipt_link_text}\n\n"  # <-- Вставляем ссылку сюда
             f"{items_text}\n"
             f"💰 <b>Итого:</b> {total_sum:.2f} ₽\n"
             f"💳 <b>Баланс:</b> {balance:.2f} ₽"

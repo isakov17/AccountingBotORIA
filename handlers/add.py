@@ -426,6 +426,7 @@ async def process_receipt_comment(message: Message, state: FSMContext) -> None:
         "receipt_type": receipt_type,
         "fiscal_doc": parsed_data.get("fiscal_doc", ""),
         "qr_string": parsed_data.get("qr_string", ""),
+        "pdf_url": parsed_data.get("pdf_url", ""),
         "delivery_dates": delivery_dates,
         "links": links,
         "comments": comments,
@@ -487,6 +488,9 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
         delivery_date_header = delivery_dates[0] if delivery_dates else "—"
         operation_date = datetime.now().strftime("%d.%m.%Y")
 
+        # ✅ ДОБАВИТЬ ЭТУ СТРОЧКУ СЮДА:
+        pdf_link = receipt.get("pdf_url", "")
+        
         items_list = []
         for i, item in enumerate(items):
             deliv_date = delivery_dates[i] if i < len(delivery_dates) else ""
@@ -509,7 +513,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             fiscal_doc=receipt.get("fiscal_doc", ""),
             operation_date=operation_date,
             balance=balance,
-            is_group=True
+            is_group=True,
+            pdf_url=pdf_link
         )
 
         # 🔔 Личное уведомление пользователю
@@ -522,7 +527,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             operation_date=operation_date,
             balance=balance,
             is_group=False,
-            chat_id=callback.message.chat.id
+            chat_id=callback.message.chat.id,
+            pdf_url=pdf_link
         )
 
         await loading_message.delete()

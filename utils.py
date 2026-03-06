@@ -82,7 +82,16 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
             if response.status == 200:
                 result = await response.json()
                 if result.get("code") == 1:
-                    data_json = result.get("data", {}).get("json", {})
+                    data_block = result.get("data", {})
+                    data_json = data_block.get("json", {})
+                    # ✅ НОВЫЕ ЛОГИ: Смотрим всю структуру, которую вернул API
+                    logger.info(f"--- DEBUG API ---")
+                    logger.info(f"Ключи внутри 'data': {list(data_block.keys())}")
+                    logger.info(f"Значение 'pdfurl' напрямую: '{data_block.get('pdfurl', 'НЕТ КЛЮЧА')}'")
+                    logger.info(f"-----------------")
+                    # ✅ НОВОЕ: Извлекаем ссылку на PDF
+                    pdf_url = data_block.get("pdfurl", "") 
+                    
                     if data_json:
                         items = data_json.get("items", [])
                         excluded_items = get_excluded_items()  # Твоя функция? (или DEFAULT)
@@ -130,6 +139,7 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
                             "total_sum": filtered_total,  # Для add.py (filtered, как раньше)
                             "totalSum": total_sum_raw,  # ✅ НОВОЕ: Полная для return.py (full, 2019.00)
                             "excluded_sum": excluded_sum,
+                            "pdf_url": pdf_url, # ✅ НОВОЕ: Передаем ссылку на PDF
                             "excluded_items": [
                                 item.get("name") for item in items if is_excluded(item.get("name", "").strip())
                             ]
@@ -145,7 +155,6 @@ async def parse_qr_from_photo(bot, file_id) -> dict | None:
             else:
                 logger.error(f"Ошибка отправки на proverkacheka.com: status={response.status}")
                 return None
-            # ... (остальной код, если есть)
 
 async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str, Optional[Dict]]:
     """
@@ -224,7 +233,18 @@ async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str
                                 code = result.get("code")
                                 if code == 1:
                                     # Успех: data.json
-                                    data_json = result.get("data", {}).get("json", {})
+                                    data_block = result.get("data", {})
+                                    data_json = data_block.get("json", {})
+                                    
+                                    # ✅ НОВЫЕ ЛОГИ: Смотрим всю структуру, которую вернул API
+                                    logger.info(f"--- DEBUG API ---")
+                                    logger.info(f"Ключи внутри 'data': {list(data_block.keys())}")
+                                    logger.info(f"Значение 'pdfurl' напрямую: '{data_block.get('pdfurl', 'НЕТ КЛЮЧА')}'")
+                                    logger.info(f"-----------------")
+
+                                    # ✅ НОВОЕ: Извлекаем ссылку на PDF
+                                    pdf_url = data_block.get("pdfurl", "")
+
                                     if data_json:
                                         # Парсинг по спецификации
                                         items_raw = data_json.get("items", [])
@@ -264,6 +284,7 @@ async def confirm_manual_api(data: Dict[str, Any], user: Any) -> Tuple[bool, str
                                             "total_sum": filtered_total,
                                             "excluded_sum": excluded_sum,
                                             "excluded_items": excluded_items_list,
+                                            "pdf_url": pdf_url, # ✅ НОВОЕ: Передаем ссылку на PDF
                                             "nds18": data_json.get("nds18", 0) / 100.0,
                                             "nds": data_json.get("nds", 0) / 100.0,
                                             "nds0": data_json.get("nds0", 0) / 100.0,
