@@ -433,12 +433,11 @@ async def update_balance_cache_with_delta(new_balance_data: dict):
     await cache_set(BALANCE_CACHE_KEY, json.dumps(new_balance_data), expire=BALANCE_EXPIRE)
     logger.debug("Balance cache updated with delta")
 
-    # NOVOYE: Batch update для нескольких строк (1 API call вместо N)
 async def batch_update_sheets(updates: list):
     """Batch update values в sheets (list of {'range': 'A1:Q1', 'values': [[...]]})."""
     try:
         body = {
-            "valueInputOption": "RAW",
+            "valueInputOption": "USER_ENTERED",  # ✅ ИЗМЕНЕНО: Было RAW, теперь USER_ENTERED для работы формул
             "data": updates  # [{'range': ..., 'values': [[row]]}, ...]
         }
         result = await async_sheets_call(

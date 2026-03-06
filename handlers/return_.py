@@ -19,6 +19,7 @@ from config import SHEET_NAME
 from handlers.notifications import send_notification
 from googleapiclient.errors import HttpError
 from datetime import datetime
+import urllib.parse
 
 logger = logging.getLogger("AccountingBot")
 return_router = Router()
@@ -313,6 +314,17 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
         rows = result.get("values", [])[1:]
         updated_items, found = [], False
 
+        # ✅ НОВОЕ: Извлекаем ссылку на PDF возврата и готовим кнопку
+        pdf_url = parsed_data.get("pdf_url", "")
+        qr_string = parsed_data.get("qr_string", "")
+        
+        if pdf_url:
+            qr_cell_value = f'=HYPERLINK("{pdf_url}"; "📄 PDF Возврата")'
+        else:
+            safe_qr = urllib.parse.quote(qr_string)
+            fallback_link = f"https://proverkacheka.com/qrcode/generate?text={safe_qr}"
+            qr_cell_value = f'=HYPERLINK("{fallback_link}"; "⏳ PDF готовится (QR)")'
+
         for i, row in enumerate(rows, start=2):
             if len(row) < 13:
                 continue
@@ -320,12 +332,15 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 while len(row) < 17:
                     row.append("")
                 row[8] = "Возвращен"
-                row[14] = parsed_data.get("qr_string", "")
+                
+                # ✅ ИЗМЕНЕНО: Записываем готовую формулу гиперссылки в столбец O (индекс 14)
+                row[14] = qr_cell_value 
+                
                 await async_sheets_call(
                     sheets_service.spreadsheets().values().update,
                     spreadsheetId=SHEET_NAME,
                     range=f"Чеки!A{i}:Q{i}",
-                    valueInputOption="RAW",
+                    valueInputOption="USER_ENTERED", # ✅ ИЗМЕНЕНО: Чтобы формула сработала
                     body={"values": [row]}
                 )
 
@@ -340,7 +355,7 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 })
 
                 await save_receipt_summary(
-                    date_purchase,  # ← Дата оригинальной покупки (январь)
+                    date_purchase,
                     "Возврат",
                     total_return_sum,
                     f"{new_fiscal_doc} - {item_name}"
@@ -362,7 +377,8 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 fiscal_doc=new_fiscal_doc,
                 operation_date=operation_date,
                 balance=balance,
-                is_group=True
+                is_group=True,
+                pdf_url=pdf_url  # ✅ НОВОЕ: Передаем ссылку на чек возврата в группу
             )
             await send_notification(
                 bot=callback.bot,
@@ -373,7 +389,8 @@ async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext)
                 operation_date=operation_date,
                 balance=balance,
                 is_group=False,
-                chat_id=callback.message.chat.id
+                chat_id=callback.message.chat.id,
+                pdf_url=pdf_url  # ✅ НОВОЕ: Передаем ссылку пользователю
             )
             await callback.message.edit_text(
                 f"✅ Возврат {item_name} подтверждён.\n"

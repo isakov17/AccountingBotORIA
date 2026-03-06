@@ -22,6 +22,7 @@ from googleapiclient.errors import HttpError
 import logging
 from difflib import SequenceMatcher
 from datetime import datetime
+import urllib.parse
 
 logger = logging.getLogger("AccountingBot")
 expenses_router = Router()
@@ -266,7 +267,17 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
     sel_items = [items[i] for i in selected]
     parsed = data.get("qr_parsed", {})
     new_fd = parsed.get("fiscal_doc", "")
+    
+    # ✅ НОВОЕ: Извлекаем ссылку на PDF полного чека и готовим кнопку
+    pdf_url = parsed.get("pdf_url", "")
     qr_str = parsed.get("qr_string", "")
+    
+    if pdf_url:
+        qr_cell_value = f'=HYPERLINK("{pdf_url}"; "📄 Открыть PDF")'
+    else:
+        safe_qr = urllib.parse.quote(qr_str)
+        fallback_link = f"https://proverkacheka.com/qrcode/generate?text={safe_qr}"
+        qr_cell_value = f'=HYPERLINK("{fallback_link}"; "⏳ PDF готовится (QR)")'
 
     updates = []
     updated_items = []
@@ -286,7 +297,9 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
             row[8] = "Доставлено"
             row[11] = "Полный"
             row[12] = str(new_fd)
-            row[13] = qr_str
+            
+            # ✅ ИЗМЕНЕНО: Записываем готовую формулу в столбец N (индекс 13)
+            row[13] = qr_cell_value 
 
             updates.append({"range": f"Чеки!A{row_index}:Q{row_index}", "values": [row]})
 
@@ -321,7 +334,8 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
             fiscal_doc=new_fd,
             operation_date=operation_date,
             balance=balance,
-            is_group=True
+            is_group=True,
+            pdf_url=pdf_url  # ✅ НОВОЕ: Передаем ссылку на чек полного расчета
         )
         await send_notification(
             bot=callback.bot,
@@ -332,7 +346,8 @@ async def confirm_delivery_many(callback: CallbackQuery, state: FSMContext) -> N
             operation_date=operation_date,
             balance=balance,
             is_group=False,
-            chat_id=callback.message.chat.id
+            chat_id=callback.message.chat.id,
+            pdf_url=pdf_url  # ✅ НОВОЕ: Передаем ссылку на чек полного расчета
         )
         await callback.message.edit_text(f"✅ Доставка подтверждена ({ok} позиций). Баланс: {balance:.2f} ₽")
     else:
