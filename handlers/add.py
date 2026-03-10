@@ -504,7 +504,7 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
                 "delivery_date": deliv_date
             })
 
-        # 🔔 Уведомление в группу
+# 🔔 Уведомление в группу
         await send_notification(
             bot=callback.bot,
             action="🧾 Добавлен новый чек",
@@ -514,7 +514,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             operation_date=operation_date,
             balance=balance,
             is_group=True,
-            pdf_url=pdf_link
+            pdf_url=pdf_link,
+            excluded_sum=excluded_sum  # ✅ НОВОЕ: Передаем сумму исключений
         )
 
         # 🔔 Личное уведомление пользователю
@@ -528,7 +529,8 @@ async def confirm_add_action(callback: CallbackQuery, state: FSMContext) -> None
             balance=balance,
             is_group=False,
             chat_id=callback.message.chat.id,
-            pdf_url=pdf_link
+            pdf_url=pdf_link,
+            excluded_sum=excluded_sum  # ✅ НОВОЕ: Передаем сумму исключений
         )
 
         await loading_message.delete()

@@ -29,7 +29,8 @@ async def send_notification(
     balance: float,
     is_group: bool = False,
     chat_id: int = None,
-    pdf_url: str = ""
+    pdf_url: str = "",
+    excluded_sum: float = 0.0  # ✅ НОВОЕ: Добавлен аргумент для суммы доставки/исключений
 ):
     """
     Универсальная функция отправки уведомления.
@@ -49,29 +50,38 @@ async def send_notification(
             for item in items
         ]
 
-        total_sum = sum(it["sum"] for it in normalized_items)
-        total_positions = len(normalized_items)
+        items_total = sum(it["sum"] for it in normalized_items)
+        full_total = items_total + excluded_sum  # Полная сумма чека с учетом доставки
 
         items_text = "\n".join(
             f"▫️ <b>{it['name']}</b>\n"
-            f"   ├ 💰 {it['quantity']} × {it['price']:.2f} ₽ = <b>{it['sum']:.2f} ₽</b>\n"
-            + (f"   ├ 📅 {it['delivery_date']}\n" if it['delivery_date'] else "")
-            + (f"   ├ 🔗 <a href=\"{it['link']}\">Ссылка</a>\n" if it['link'] else "")
-            + (f"   └ 💬 {it['comment']}\n" if it['comment'] else "")
+            f"   ├ 💰 {it['quantity']} × {it['price']:.2f} ₽ = <b>{it['sum']:.2f} ₽</b>"
+            + (f"\n   ├ 📅 {it['delivery_date']}" if it['delivery_date'] else "")
+            + (f"\n   ├ 🔗 <a href=\"{it['link']}\">Ссылка</a>" if it['link'] else "")
+            + (f"\n   └ 💬 {it['comment']}" if it['comment'] else "")
             for it in normalized_items
         )
 
-        # ✅ НОВОЕ: Формируем строку с ссылкой на чек, если она есть
         receipt_link_text = f"\n📄 Чек (PDF): <a href=\"{pdf_url}\">Скачать / Открыть</a>" if pdf_url else ""
+
+        # ✅ НОВОЕ: Если есть доставка (исключения) - расписываем подробно. Если нет - просто Итого.
+        if excluded_sum > 0:
+            totals_text = (
+                f"💰 <b>Сумма товаров:</b> {items_total:.2f} ₽\n"
+                f"🚚 <b>Исключено (доставка/услуги):</b> {excluded_sum:.2f} ₽\n"
+                f"🧾 <b>Полная сумма чека:</b> {full_total:.2f} ₽"
+            )
+        else:
+            totals_text = f"💰 <b>Итого:</b> {items_total:.2f} ₽"
 
         text = (
             f"<b>{action}</b>\n\n"
             f"👤 Пользователь: <b>{user_name}</b>\n"
             f"🧾 Фискальный номер: <code>{fiscal_doc}</code>\n"
-            f"📅 Дата операции: {operation_date or datetime.now().strftime('%d.%m.%Y')}\n\n"
-            f"{receipt_link_text}\n\n"  # <-- Вставляем ссылку сюда
-            f"{items_text}\n"
-            f"💰 <b>Итого:</b> {total_sum:.2f} ₽\n"
+            f"📅 Дата операции: {operation_date or datetime.now().strftime('%d.%m.%Y')}"
+            f"{receipt_link_text}\n\n"
+            f"{items_text}\n\n"
+            f"{totals_text}\n"  # <--- Используем наш новый красивый блок итогов
             f"💳 <b>Баланс:</b> {balance:.2f} ₽"
         )
 
