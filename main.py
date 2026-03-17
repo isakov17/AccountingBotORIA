@@ -4,7 +4,9 @@ import signal
 from aiogram import Bot, Dispatcher, BaseMiddleware, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery
-from config import TELEGRAM_TOKEN
+from aiogram.client.session.aiohttp import AiohttpSession # <-- ИМПОРТ ДЛЯ ПРОКСИ
+
+from config import TELEGRAM_TOKEN, PROXY_URL # <-- ИМПОРТ PROXY_URL
 from handlers.commands import router as commands_router
 from handlers.add import add_router
 from handlers.return_ import return_router
@@ -83,9 +85,16 @@ class GroupFilterMiddleware(BaseMiddleware):
 
 
 # ---------------------------------------------------------
-# Инициализация бота и диспетчера
+# Инициализация бота и диспетчера (БЕЗОПАСНАЯ ИНТЕГРАЦИЯ ПРОКСИ)
 # ---------------------------------------------------------
-bot = Bot(token=TELEGRAM_TOKEN)
+if PROXY_URL:
+    logger.info("Инициализация бота с использованием прокси.")
+    session = AiohttpSession(proxy=PROXY_URL)
+    bot = Bot(token=TELEGRAM_TOKEN, session=session)
+else:
+    logger.info("Инициализация бота без прокси (напрямую).")
+    bot = Bot(token=TELEGRAM_TOKEN)
+
 dp = Dispatcher()
 
 # Регистрируем мидлвари — сначала фильтр групп (чтобы он прерывал обработку при необходимости),

@@ -18,11 +18,18 @@ OCR_API_KEY = os.getenv("OCR_API_KEY", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SPREADSHEETS_LINK = os.getenv("SPREADSHEETS_LINK", "https://docs.google.com/spreadsheets/d/example").strip()
 
+# --- ДОБАВЛЕНО: Чтение прокси из .env ---
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
 # Warnings для optional
 if not OCR_API_KEY:
     logger.warning("OCR_API_KEY not set, OCR features disabled")
 if GROUP_CHAT_ID == 0:
     logger.warning("GROUP_CHAT_ID not set, group notifications disabled")
+if not PROXY_URL:
+    logger.warning("PROXY_URL not set, bot will run without proxy")
+else:
+    logger.info("PROXY_URL loaded successfully")
 
 # Загрузка Google Credentials
 try:
