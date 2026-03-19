@@ -33,7 +33,7 @@ class ReturnReceipt(StatesGroup):
 @return_router.message(Command("return"))
 async def return_receipt(message: Message, state: FSMContext):
     if not await is_user_allowed(message.from_user.id):
-        await message.answer("Доступ запрещен.", reply_markup=reset_keyboard())  # OK: answer
+        await message.answer("Доступ запрещен.", reply_markup=reset_keyboard())  
         logger.info(f"Доступ запрещен для /return: user_id={message.from_user.id}")
         return
     
@@ -41,73 +41,88 @@ async def return_receipt(message: Message, state: FSMContext):
         "Пожалуйста, введите фискальный номер чека **или название/часть названия товара** для возврата:\n"
         "• Пример: '191208' (номер)\n"
         "• Пример: 'антенна угл' (имя)\n",
-        reply_markup=reset_keyboard()  # OK: answer
+        reply_markup=reset_keyboard()  
     )
     await state.set_state(ReturnReceipt.ENTER_SEARCH_TERM)
     logger.info(f"Запрос поиска для /return: user_id={message.from_user.id}")
 
 @return_router.message(ReturnReceipt.ENTER_SEARCH_TERM)
 async def process_search_term(message: Message, state: FSMContext):
-    search_term = message.text.strip().lower()  # Нормализация
+    search_term = message.text.strip().lower()  
 
     if not search_term:
-        await message.answer("Запрос не может быть пустым. Попробуйте снова.", reply_markup=reset_keyboard())  # OK: answer
+        await message.answer("Запрос не может быть пустым. Попробуйте снова.", reply_markup=reset_keyboard())  
         return
 
-    if len(search_term) > 50:  # Разумный лимит
-        await message.answer("Запрос слишком длинный. Укоротите.", reply_markup=reset_keyboard())  # OK: answer
+    if len(search_term) > 50:  
+        await message.answer("Запрос слишком длинный. Укоротите.", reply_markup=reset_keyboard())  
         return
 
     try:
-        # 1 запрос на все данные
         result = await async_sheets_call(
             sheets_service.spreadsheets().values().get,
             spreadsheetId=SHEET_NAME, range="Чеки!A:Q"
         )
-        rows = result.get("values", [])[1:]  # Пропуск заголовка
+        rows = result.get("values", [])[1:]  
         logger.info(f"Поиск по '{search_term}': загружено {len(rows)} строк из Чеки!A:Q")
 
         matches = []
-        is_fiscal_search = search_term.isdigit()  # Цифры → поиск по fiscal
+        is_fiscal_search = search_term.isdigit()  
 
-        for row in rows:
-            if len(row) < 13:  # Минимум до M=fiscal
+        for i, row in enumerate(rows): # Добавил enumerate для надежности, если нужен row_index
+            if len(row) < 13:  
                 continue
-            if row[8] == "Возвращен":  # I=8: Уже возвращён
+            if len(row) > 8 and row[8] == "Возвращен":  
                 continue
 
             fiscal_doc = str(row[12] or "").strip()  # M=12
             item_name = (row[10] or "").strip() if len(row) > 10 else "Неизвестно"  # K=10
-            date_purchase = (row[1] or "").strip() if len(row) > 1 else "—"  # B=1: Дата покупки
+            date_purchase = (row[1] or "").strip() if len(row) > 1 else "—"  # B=1
+            
+            # ✅ НОВОЕ: Извлекаем цену товара (Столбец D = Индекс 3)
+            # Так как в таблице могут быть пробелы или запятые, чистим строку
+            raw_price = str(row[3]).replace(" ", "").replace(",", ".") if len(row) > 3 else "0"
+            try:
+                item_price = float(raw_price)
+            except ValueError:
+                item_price = 0.0
+
+            # Формируем словарь с данными о товаре
+            match_data = {
+                "fiscal": fiscal_doc, 
+                "item": item_name, 
+                "date": date_purchase, 
+                "price": item_price, # <-- Сохраняем цену
+                "row_index": len(matches) # Используем длину списка как уникальный ID для inline кнопок
+            }
 
             if is_fiscal_search:
                 if fiscal_doc == search_term:
-                    matches.append({"fiscal": fiscal_doc, "item": item_name, "date": date_purchase, "row_index": len(matches)})
+                    matches.append(match_data)
             else:
-                # Частичное по имени (case-insensitive)
                 if search_term in item_name.lower():
-                    matches.append({"fiscal": fiscal_doc, "item": item_name, "date": date_purchase, "row_index": len(matches)})
+                    matches.append(match_data)
 
         count = len(matches)
-        logger.info(f"Поиск по '{search_term}' ({'fiscal' if is_fiscal_search else 'имя'}): найдено {count} совпадений")
+        logger.info(f"Поиск по '{search_term}': найдено {count} совпадений")
 
         if count == 0:
             await message.answer(
                 f"Чеки с номером '{search_term}' или товаром, содержащим '{search_term}', не найдены "
                 f"(или уже возвращены). Уточните запрос и попробуйте снова.",
-                reply_markup=reset_keyboard()  # OK: answer
+                reply_markup=reset_keyboard()  
             )
             return
 
         if count > 10:
             await message.answer(
                 f"Слишком много совпадений ({count}). Уточните запрос (больше деталей по товару или fiscal).",
-                reply_markup=reset_keyboard()  # OK: answer
+                reply_markup=reset_keyboard()  
             )
             return
 
         # Подготовка data
-        item_map = {m["row_index"]: m for m in matches}  # {index: {"fiscal": ..., "item": ..., "date": ...}}
+        item_map = {m["row_index"]: m for m in matches}  
         await state.update_data(item_map=item_map, search_term=search_term)
 
         if count == 1:
@@ -116,56 +131,58 @@ async def process_search_term(message: Message, state: FSMContext):
             await state.update_data(
                 fiscal_doc=match["fiscal"],
                 item_name=match["item"],
-                date_purchase=match["date"]
+                date_purchase=match["date"],
+                item_price=match["price"] # <-- Передаем цену в state
             )
             await message.answer(
                 f"✅ Найден единственный вариант:\n"
                 f"• Товар: {match['item']}\n"
+                f"• Цена: {match['price']:.2f} ₽\n" # <-- Показываем цену пользователю
                 f"• Fiscal: {match['fiscal']}\n"
-                f"• Дата покупки: {match['date']}\n\n"
+                f"• Дата: {match['date']}\n\n"
                 f"Отправьте QR-код чека возврата.",
-                reply_markup=reset_keyboard()  # OK: answer
+                reply_markup=reset_keyboard()  
             )
             await state.set_state(ReturnReceipt.UPLOAD_RETURN_QR)
-            logger.info(f"Авто-переход для '{search_term}': fiscal={match['fiscal']}, item={match['item']}, user_id={message.from_user.id}")
+            logger.info(f"Авто-переход: fiscal={match['fiscal']}, item={match['item']}, price={match['price']}")
             return
 
-        # ✅ ФИКС: Компактные кнопки (1 строка, <50 символов) + нумерованный список в сообщении для контекста
+        # Если вариантов несколько - создаем кнопки
         button_texts = []
+        inline_keyboard_buttons = []
+        
         for i, m in enumerate(matches, 1):
             short_item = m['item'][:20] + '...' if len(m['item']) > 20 else m['item']
-            button_texts.append(f"{i}. {short_item} (fiscal: {m['fiscal']}, дата: {m['date']})")
+            # В текст сообщения добавляем цену для ясности
+            button_texts.append(f"{i}. {short_item} ({m['price']:.2f}₽, f: {m['fiscal']}, d: {m['date']})")
+            
+            inline_keyboard_buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{i}. {short_item} ({m['price']:.2f}₽)", 
+                        callback_data=f"select_return_{m['fiscal']}_{m['row_index']}"
+                    )
+                ]
+            )
 
-        inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"{m['item'][:20] + '...' if len(m['item']) > 20 else m['item']} (f {m['fiscal']}, d {m['date']})",  # ✅ Создает текст прямо здесь для КАЖДОЙ кнопки!
-                    callback_data=f"select_return_{m['fiscal']}_{m['row_index']}"
-                )
-            ] for m in matches
-        ])
-
-        list_text = "\n".join(button_texts)  # Нумерованный список для деталей
+        list_text = "\n".join(button_texts)  
         await message.answer(
-            f"✅ Найдено {count} совпадений по '{search_term}'. Выберите товар:\n"
-            f"{list_text}\n\n"
-            f"(Кнопки с краткими деталями; полный список выше)",
-            reply_markup=inline_keyboard
+            f"✅ Найдено {count} совпадений по '{search_term}'. Выберите товар:\n\n"
+            f"{list_text}\n\n",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_keyboard_buttons)
         )
         await state.set_state(ReturnReceipt.SELECT_ITEM)
-        logger.info(f"Список для выбора: {count} вариантов по '{search_term}', user_id={message.from_user.id}")
 
     except HttpError as e:
-        await message.answer(f"Ошибка получения данных из Google Sheets: {e.status_code} - {e.reason}. Проверьте /debug.", reply_markup=reset_keyboard())  # OK: answer
-        logger.error(f"Ошибка поиска /return: {e.status_code} - {e.reason}, term={search_term}, user_id={message.from_user.id}")
+        await message.answer(f"Ошибка получения данных из Google Sheets: {e.status_code} - {e.reason}.", reply_markup=reset_keyboard())  
     except Exception as e:
-        await message.answer(f"Неожиданная ошибка: {str(e)}. Проверьте /debug.", reply_markup=reset_keyboard())  # OK: answer
-        logger.error(f"Неожиданная ошибка поиска /return: {str(e)}, term={search_term}, user_id={message.from_user.id}")
+        await message.answer(f"Неожиданная ошибка: {str(e)}.", reply_markup=reset_keyboard())
+
 
 @return_router.callback_query(ReturnReceipt.SELECT_ITEM)
 async def process_return_item(callback: CallbackQuery, state: FSMContext):
     try:
-        data_parts = callback.data.split("_")   # select_return_{fiscal}_{index}
+        data_parts = callback.data.split("_")   
         if len(data_parts) != 4 or data_parts[0] != "select" or data_parts[1] != "return":
             raise ValueError("Неверный callback")
 
@@ -173,27 +190,33 @@ async def process_return_item(callback: CallbackQuery, state: FSMContext):
         index = int(data_parts[3])
         state_data = await state.get_data()
         item_map = state_data.get("item_map", {})
-        match = item_map.get(index, None)
+        # Преобразуем ключи item_map обратно в int, так как state мог сохранить их как строки (json)
+        match = item_map.get(str(index)) or item_map.get(index) 
 
         if not match:
-            await callback.message.answer("Ошибка: вариант не найден.", reply_markup=reset_keyboard())  # OK: answer
-            logger.error(f"Вариант не найден в item_map: index={index}, user_id={callback.from_user.id}")
+            await callback.message.answer("Ошибка: вариант не найден.", reply_markup=reset_keyboard())  
             await state.clear()
             await callback.answer()
             return
 
+        # ✅ НОВОЕ: Сохраняем цену в state при выборе товара из списка
         await state.update_data(
             fiscal_doc=fiscal_doc,
             item_name=match["item"],
-            date_purchase=match["date"]
+            date_purchase=match["date"],
+            item_price=match["price"] # <-- ПЕРЕДАЕМ ЦЕНУ
         )
-        await callback.message.answer("Отправьте QR-код чека возврата.", reply_markup=reset_keyboard())  # OK: answer
+        
+        await callback.message.edit_text(
+            f"Выбран товар: {match['item']} ({match['price']:.2f} ₽).\n\n"
+            f"Отправьте QR-код чека возврата."
+        )
         await state.set_state(ReturnReceipt.UPLOAD_RETURN_QR)
         await callback.answer()
-        logger.info(f"Товар выбран из списка: fiscal={fiscal_doc}, item={match['item']}, user_id={callback.from_user.id}")
-    except (ValueError, KeyError) as e:
-        await callback.message.answer("Ошибка выбора. Попробуйте /return заново.", reply_markup=reset_keyboard())  # OK: answer
-        logger.error(f"Ошибка выбора: callback_data={callback.data}, error={str(e)}, user_id={callback.from_user.id}")
+        
+    except Exception as e:
+        await callback.message.answer("Ошибка выбора. Попробуйте /return заново.", reply_markup=reset_keyboard())  
+        logger.error(f"Ошибка выбора: {str(e)}")
         await state.clear()
         await callback.answer()
 
@@ -202,44 +225,28 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
     loading_message = await message.answer("⌛ Обработка QR-кода возврата... Пожалуйста, подождите.")
 
     if not message.photo:
-        await loading_message.edit_text("Пожалуйста, отправьте фото QR-кода.", reply_markup=None)  # ✅ ФИКС: None
+        await loading_message.edit_text("Пожалуйста, отправьте фото QR-кода.", reply_markup=None)
         logger.info(f"Фото отсутствует для возврата: user_id={message.from_user.id}")
         return
 
     data = await state.get_data()
     expected_item = data.get("item_name", "")
+    
+    # Достаем цену товара из состояния (убедись, что она сохраняется на этапе SELECT_ITEM)
+    expected_price = safe_float(data.get("item_price", 0))
 
     parsed_data = await parse_qr_from_photo(bot, message.photo[-1].file_id)
     if not parsed_data:
-        await loading_message.edit_text("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=None)  # ✅ ФИКС
+        await loading_message.edit_text("Ошибка обработки QR-кода. Убедитесь, что QR-код четкий.", reply_markup=None)
         logger.info(f"Ошибка обработки QR-кода для возврата: user_id={message.from_user.id}")
         return
 
     if parsed_data.get("operation_type") != 2:
-        await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=None)  # ✅ ФИКС
+        await loading_message.edit_text("Чек должен быть возвратом (operationType == 2).", reply_markup=None)
         logger.info(f"Некорректный чек для возврата: operation_type={parsed_data.get('operation_type')}, user_id={message.from_user.id}")
         return
 
-    # ✅ Проверка: Товар в items (filtered, для валидации)
-    def norm(s: str) -> str:
-        return (s or "").lower().strip()
-
-    tgt = norm(expected_item)
-    found_match = False
-    for it in parsed_data.get("items", []):
-        name = norm(it.get("name", ""))
-        if tgt in name or name in tgt or name == tgt:
-            found_match = True
-            break
-
-    if not found_match:
-        await loading_message.edit_text(f"Товар «{expected_item}» не найден в items чека возврата.", reply_markup=None)  # ✅ ФИКС
-        logger.info(
-            f"Товар не найден в QR возврата: expected='{expected_item}', qr_items={[it.get('name') for it in parsed_data.get('items', [])]}, user_id={message.from_user.id}"
-        )
-        return
-
-    # ✅ НОВОЕ: Полная сумма возврата из QR (totalSum, включая всё)
+    # ✅ НОВОЕ: Сначала вычисляем полную сумму возврата из QR (totalSum), чтобы использовать в валидации
     total_return_sum = safe_float(parsed_data.get("totalSum", 0))
 
     if total_return_sum <= 0:
@@ -247,15 +254,51 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         total_return_sum = items_total + safe_float(parsed_data.get("excluded_sum", 0))
         logger.warning(f"Fallback total_return_sum: {total_return_sum:.2f} (totalSum был 0, used items + excluded)")
 
-    logger.info(f"QR возврата: totalSum={total_return_sum}, items_count={len(parsed_data.get('items', []))}, excluded_sum={parsed_data.get('excluded_sum', 0)}")  # ✅ ЛОГ ДЛЯ ДИАГНОСТИКИ
+    logger.info(f"QR возврата: totalSum={total_return_sum}, items_count={len(parsed_data.get('items', []))}, excluded_sum={parsed_data.get('excluded_sum', 0)}")
+    
     if total_return_sum <= 0:
-        await loading_message.edit_text("Сумма возврата в QR нулевая или некорректная.", reply_markup=None)  # ✅ ФИКС
+        await loading_message.edit_text("Сумма возврата в QR нулевая или некорректная.", reply_markup=None)
         logger.info(f"Нулевая сумма в QR возврата: totalSum={total_return_sum}, user_id={message.from_user.id}")
+        return
+
+    # ✅ Проверка: Валидация по имени ИЛИ по цене
+    def norm(s: str) -> str:
+        return (s or "").lower().strip()
+
+    # 1. Проверяем совпадение по имени
+    tgt = norm(expected_item)
+    name_match = False
+    for it in parsed_data.get("items", []):
+        name = norm(it.get("name", ""))
+        if tgt in name or name in tgt or name == tgt:
+            name_match = True
+            break
+
+    # 2. Проверяем совпадение по сумме (допускаем погрешность в пару копеек из-за float)
+    price_match = (expected_price > 0) and abs(total_return_sum - expected_price) < 0.05
+
+    # Если ни имя не подошло, ни цена не совпала — отклоняем
+    if not (name_match or price_match):
+        error_msg = (
+            f"⚠️ Ошибка валидации чека возврата.\n\n"
+            f"Товар «{expected_item}» не найден по названию, "
+            f"а сумма чека возврата ({total_return_sum:.2f} ₽) "
+        )
+        if expected_price > 0:
+            error_msg += f"не совпадает с изначальной ценой товара ({expected_price:.2f} ₽)."
+        else:
+            error_msg += f"и цену товара в базе не удалось определить."
+
+        await loading_message.edit_text(error_msg, reply_markup=None)
+        logger.info(
+            f"Товар не найден в QR возврата: Name match={name_match}, Price match={price_match} "
+            f"(Total={total_return_sum}, Expected={expected_price}), user_id={message.from_user.id}"
+        )
         return
 
     new_fiscal_doc = parsed_data.get("fiscal_doc", "")
     if not await is_fiscal_doc_unique(new_fiscal_doc):
-        await loading_message.edit_text(f"Чек возврата с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=None)  # ✅ ФИКС
+        await loading_message.edit_text(f"Чек возврата с фискальным номером {new_fiscal_doc} уже существует.", reply_markup=None)
         logger.info(f"Дубликат фискального номера в QR возврата: {new_fiscal_doc}, user_id={message.from_user.id}")
         return
 
@@ -276,7 +319,8 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
         [InlineKeyboardButton(text="Подтвердить", callback_data="confirm_return")],
         [InlineKeyboardButton(text="Отмена", callback_data="cancel_return")]
     ])
-    await loading_message.edit_text(f"✅ QR возврата обработан. Детали:\n{details}\n\nПодтвердите или отмените:", reply_markup=inline_keyboard)  # Inline OK
+    await loading_message.edit_text(f"✅ QR возврата обработан. Детали:\n{details}\n\nПодтвердите или отмените:", reply_markup=inline_keyboard)
+    
     await state.update_data(
         new_fiscal_doc=new_fiscal_doc,
         parsed_data=parsed_data,
@@ -287,7 +331,7 @@ async def process_return_qr(message: Message, state: FSMContext, bot: Bot):
     )
     await state.set_state(ReturnReceipt.CONFIRM_ACTION)
     logger.info(f"Возврат готов к подтверждению: old_fiscal={fiscal_doc}, new_fiscal={new_fiscal_doc}, item={item_name}, total_return_sum={total_return_sum}, user_id={message.from_user.id}")
-
+    
 @return_router.callback_query(ReturnReceipt.CONFIRM_ACTION, lambda c: c.data in ["confirm_return", "cancel_return"])
 async def handle_return_confirmation(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
