@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ИСПРАВЛЕННЫЙ ПУТЬ
-PROJECT_DIR="$HOME/german/AccountingBotORIA"
+PROJECT_DIR="$HOME/project/AccountingBotORIA"
 SERVICE_NAME="accountingbot"
 BRANCH="main"
 
